@@ -9,6 +9,6 @@ class BaseTool(ABC):
     usage_example: str
 
     @abstractmethod
-    def execute(self, input_str: str) -> str:
+    async def execute(self, input_str: str) -> str:
         """Execute the tool and return a string observation."""
         pass

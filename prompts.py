@@ -19,8 +19,9 @@ def build_system_prompt() -> str:
 # ---------------------------------------------------------------------------
 # Planner: outputs a numbered list of sub-tasks
 # ---------------------------------------------------------------------------
-def build_planner_prompt() -> str:
+def build_planner_prompt(role_addendum: str = "") -> str:
     tool_descriptions = _tool_descriptions()
+    role_block = f"\n\nYour approach: {role_addendum}" if role_addendum else ""
     return f"""You are a task planner. Break the user request into a numbered checklist of sub-tasks.
 
 Available tools:
@@ -48,7 +49,7 @@ User: What time is it and what is 100 / 4?
 
 User: What was Apple stock price yesterday?
 1. [search] Search for Apple stock price yesterday
-
+{role_block}
 Now respond with ONLY a numbered list.
 """
 
@@ -56,7 +57,7 @@ Now respond with ONLY a numbered list.
 # ---------------------------------------------------------------------------
 # Executor: the ReAct worker that uses tools
 # ---------------------------------------------------------------------------
-def build_executor_prompt(task: str = "", history: str = "", feedback: str = "") -> str:
+def build_executor_prompt(task: str = "", history: str = "", feedback: str = "", role_addendum: str = "") -> str:
     tool_descriptions = _tool_descriptions()
 
     context_block = ""
@@ -66,6 +67,8 @@ def build_executor_prompt(task: str = "", history: str = "", feedback: str = "")
         context_block += f"\n\nPrevious results:\n{history}"
     if feedback:
         context_block += f"\n\nPrevious attempt FAILED: {feedback}. Try differently."
+    if role_addendum:
+        context_block += f"\n\nYour approach: {role_addendum}"
 
     return f"""You are a task executor. You complete the given task using tools.
 {context_block}
