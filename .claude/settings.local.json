@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(curl -s -X POST http://localhost:8000/query -H \"Content-Type: application/json\" -d '{\"\"query\"\": \"\"what was kyndryl stock price on 02/03/2026? what will it be on 05/03/2026?\"\"}')",
+      "Bash(uv run uvicorn main:app --host 0.0.0.0 --port 8000 --reload)",
+      "Bash(curl -s -X POST http://localhost:8000/agent -H \"Content-Type: application/json\" -d '{\"\"query\"\": \"\"what was kyndryl stock price on 02/03/2026? what will it be on 05/03/2026?\"\"}')"
+    ]
+  }
+}
