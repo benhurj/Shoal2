@@ -42,8 +42,9 @@ class EvaluationResult(BaseModel):
 
 
 class EnsembleMemberResult(BaseModel):
-    """Result from one member of the ensemble (one config variation)."""
-    config_label: str                        # e.g. "conservative"
+    """Result from one member of the ensemble (one role-based config)."""
+    config_label: str                        # e.g. "methodical"
+    role: str = ""                           # role name for compiler context
     llm_params: dict                         # the actual overrides used
     executor_steps: list[AgentStep] = []
     final_answer: str = ""

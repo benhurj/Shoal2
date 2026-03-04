@@ -42,15 +42,14 @@ else:
 COMPILER_TEMPERATURE = 0.8  # Higher for creative planning/compilation
 COMPILER_TOP_P = 0.95
 
-# ── Worker stochastic sampling (per-request, per-agent) ──
-TEMPERATURE_MEAN = 0.15  # Low temperature for precise executor tool-use
+# ── Stochastic sampling fallback (for overflow agents beyond defined roles) ──
+TEMPERATURE_MEAN = 0.15
 TEMPERATURE_STD = 0.05
 TOP_P_MEAN = 0.85
 TOP_P_STD = 0.05
 
-# ── Parallel execution configuration ──
-MAX_PARALLEL_WORKERS = 5  # Number of parallel LLM calls (replaces multiple ports)
-ENSEMBLE_K = 5  # Number of parallel agent loops
+# ── Ensemble configuration ──
+ENSEMBLE_K = 5  # Number of parallel agent loops (matches 5 defined roles)
 
 # ── Agent loop limits ──
 REACT_MAX_ITERATIONS = 4       # Max tool loops per executor run
