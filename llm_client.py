@@ -4,6 +4,8 @@ import re
 import httpx
 import structlog
 from concurrent.futures import ThreadPoolExecutor
+
+_RETRY_DELAYS = [2, 5, 10]  # seconds to wait between retries on 429
 from typing import Dict, List, Tuple, Optional
 from env_config import get_llm_config
 from config import LLM_MAX_TOKENS, MAX_CONCURRENT_LLM_CALLS
@@ -92,19 +94,27 @@ class LLMClient:
         payload = self._build_openai_payload(messages, model, **overrides)
         client = await self._get_async_client()
 
-        try:
-            resp = await client.post(
-                f"{self.config['base_url']}/v1/chat/completions",
-                json=payload,
-                headers=headers
-            )
-            resp.raise_for_status()
-        except httpx.TimeoutException:
-            raise RuntimeError(f"LLM call timed out (Ollama Cloud, model {model})")
-        except httpx.HTTPStatusError as e:
-            raise RuntimeError(f"LLM returned HTTP {e.response.status_code} (Ollama Cloud)")
-
-        return self._parse_openai_response(resp.json())
+        last_err = None
+        for attempt, delay in enumerate([0] + _RETRY_DELAYS):
+            if delay:
+                await asyncio.sleep(delay)
+            try:
+                resp = await client.post(
+                    f"{self.config['base_url']}/v1/chat/completions",
+                    json=payload,
+                    headers=headers
+                )
+                resp.raise_for_status()
+                return self._parse_openai_response(resp.json())
+            except httpx.TimeoutException:
+                raise RuntimeError(f"LLM call timed out (Ollama Cloud, model {model})")
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code == 429:
+                    last_err = e
+                    logger.warning("ollama_cloud_429_retry", attempt=attempt + 1, delay=_RETRY_DELAYS[attempt] if attempt < len(_RETRY_DELAYS) else "giving up")
+                    continue
+                raise RuntimeError(f"LLM returned HTTP {e.response.status_code} (Ollama Cloud)")
+        raise RuntimeError(f"LLM returned HTTP 429 (Ollama Cloud) after {len(_RETRY_DELAYS) + 1} attempts")
 
     async def _call_openai(
         self,

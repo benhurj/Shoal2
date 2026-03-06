@@ -1,4 +1,5 @@
 # prompts.py
+from datetime import date
 from tools import TOOL_REGISTRY
 
 
@@ -71,6 +72,7 @@ def build_executor_prompt(task: str = "", history: str = "", feedback: str = "",
         context_block += f"\n\nYour approach: {role_addendum}"
 
     return f"""You are a task executor. You complete the given task using tools.
+Today's date: {date.today().strftime('%B %d, %Y')}.
 {context_block}
 
 Tools:
@@ -92,13 +94,19 @@ RULES:
 # Evaluator: checks if the Executor completed a sub-task
 # ---------------------------------------------------------------------------
 def build_evaluator_prompt(task: str, worker_output: str) -> str:
-    return f"""You are a fair evaluator. You are given a sub-task instruction and the output produced by a worker.
+    return f"""You are a strict evaluator. You are given a sub-task instruction and the output produced by a worker.
 
-Determine if the worker completed the sub-task to a reasonable standard. Be lenient: if the worker addressed the core intent, it passes.
+Determine if the worker completed the sub-task to a reasonable standard.
 
 Sub-task: {task}
 
 Worker output: {worker_output}
+
+Rules:
+- PASS if the worker clearly addressed the task using evidence from tool observations.
+- FAIL if the answer is vague, unsupported, or just says it could not find the information.
+- FAIL if the answer contains specific numbers or facts with no supporting source or observation.
+- FAIL if the output is a raw tool Action/Input block rather than an actual answer.
 
 Respond with EXACTLY one of:
 - PASS
@@ -139,4 +147,27 @@ Your job:
 3. Compile a single, best answer that combines the strongest elements.
 
 Output ONLY the compiled answer. Do not mention agents, attempts, or evaluations.
+"""
+
+# ---------------------------------------------------------------------------
+# Role Designer: generates K agent personas tailored to the query
+# ---------------------------------------------------------------------------
+def build_role_designer_prompt(query: str, k: int) -> str:
+    return f"""You are a multi-agent role designer. Given a user query, generate {k} distinct agent personas that will each tackle the query from a different angle.
+
+User query: {query}
+
+For each agent, output a block in EXACTLY this format (repeat {k} times):
+
+ROLE: <short_role_name>
+STYLE: <precise|balanced|exploratory>
+PLANNER: <one sentence: how this role should plan and break down the task>
+EXECUTOR: <one sentence: how this role should execute and use tools>
+
+Rules:
+- Role names must be short (1-3 words, underscores only, no spaces)
+- STYLE must be exactly one of: precise, balanced, exploratory
+- Each persona must be genuinely different in approach
+- Tailor the personas to the nature of the query (e.g. financial queries need analyst/skeptic roles, coding queries need debugger/architect roles)
+- Output ONLY the {k} role blocks. No extra text, no numbering, no explanation.
 """

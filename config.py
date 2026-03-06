@@ -52,7 +52,11 @@ TOP_P_STD = 0.05
 ENSEMBLE_K = 5  # Number of parallel agent loops (matches 5 defined roles)
 
 # ── Agent loop limits ──
-REACT_MAX_ITERATIONS = 4       # Max tool loops per executor run
+REACT_MAX_ITERATIONS = 6       # Max tool loops per executor run
 MAX_PLAN_STEPS = 5             # Cap on planner sub-tasks
 MAX_EVALUATOR_RETRIES = 2     # Retries per sub-task before aborting
-MAX_CONCURRENT_LLM_CALLS = 10 # Semaphore limit for concurrent LLM requests
+MAX_CONCURRENT_LLM_CALLS = 3 # Semaphore limit for concurrent LLM requests
+
+# ── Search tool ──
+SEARCH_TOP_N = 3          # Default number of pages to fetch per search
+SEARCH_MAX_CHARS = 2000   # Max characters per page (truncation guard)

@@ -18,17 +18,11 @@ from prompts import (
     build_planner_prompt, build_executor_prompt,
     build_evaluator_prompt, build_compiler_prompt,
 )
-from roles import select_roles
+from roles import generate_roles
 from llm_client import llm_client
 
 logger = structlog.get_logger()
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-def build_ensemble_configs(k: int) -> list[dict]:
-    """Build K role-based ensemble configs. Uses defined roles first, stochastic overflow."""
-    return select_roles(k)
 
 # ---------------------------------------------------------------------------
 # Parser
@@ -166,7 +160,9 @@ async def run_executor(
         steps.append(step)
 
     logger.warning("executor_max_iterations", task=task[:60])
-    return steps, previous_raw, total_tokens
+    # Use last observation if no Final Answer was reached
+    last_obs = next((s.observation for s in reversed(steps) if s.observation), None)
+    return steps, last_obs or previous_raw, total_tokens
 
 async def run_evaluator(task: str, worker_output: str, **overrides) -> tuple[EvaluationResult, int]:
     """Single-turn LLM call to evaluate if the Executor completed the sub-task."""
@@ -246,7 +242,12 @@ async def run_full_agent_loop(
                 eval_result = EvaluationResult(passed=False, feedback=f"Evaluator failed: {e}")
 
             if eval_result.passed:
-                history += f"- Step {i+1} [{tool_hint}] ({sub_task}): {exec_answer}\n"
+                # Sanitize: strip raw action blocks from history
+                clean_answer = exec_answer
+                if re.search(r"^Action:\s*\w+", clean_answer, re.MULTILINE):
+                    last_obs = next((s.observation for s in reversed(exec_steps) if s.observation), None)
+                    clean_answer = last_obs or clean_answer
+                history += f"- Step {i+1} [{tool_hint}] ({sub_task}): {clean_answer}\n"
                 break
             else:
                 feedback = eval_result.feedback
@@ -306,8 +307,9 @@ async def run_agent(query: str) -> AgentResponse:
     """Run K full agent loops in parallel, then compile results."""
     total_tokens = 0
 
-    # Build K role-based configs
-    configs = build_ensemble_configs(ENSEMBLE_K)
+    # Generate K query-tailored roles via LLM
+    configs, role_tokens = await generate_roles(query, ENSEMBLE_K)
+    total_tokens += role_tokens
     logger.info("ensemble_configs", configs=[c["label"] for c in configs])
 
     # Fire K full agent loops in parallel
