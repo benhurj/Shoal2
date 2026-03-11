@@ -8,3 +8,10 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Environment secrets
+.env
+
+# Test artifacts
+out.json
+test.json
