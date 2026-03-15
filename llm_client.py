@@ -1,16 +1,61 @@
 # llm_client.py
 import asyncio
+import base64
 import re
+import math
 import httpx
+import numpy as np
 import structlog
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from typing import Dict, List, Tuple, Optional, Any
 
-_RETRY_DELAYS = [2, 5, 10]  # seconds to wait between retries on 429
-from typing import Dict, List, Tuple, Optional
+_RETRY_DELAYS = [2, 5, 10]       # seconds between retries on 429
+_COLD_START_DELAYS = [10, 20, 30, 60, 90]  # seconds between retries on 303 (cold start)
 from env_config import get_llm_config
-from config import LLM_MAX_TOKENS, MAX_CONCURRENT_LLM_CALLS
+from config import LLM_MAX_TOKENS, MAX_CONCURRENT_LLM_CALLS, LOGPROBS_TOP_K
 
 logger = structlog.get_logger()
+
+
+@dataclass
+class TokenDistribution:
+    """Represents the probability distribution for a single token position."""
+    token: str
+    logprob: float
+    probability: float
+    token_id: Optional[int] = None
+    top_alternatives: Optional[List[Tuple[str, float]]] = None  # (token, prob) pairs
+
+
+@dataclass
+class LLMResponse:
+    """Extended LLM response with distribution information."""
+    content: str
+    total_tokens: int
+    token_distributions: Optional[List[Dict[str, float]]] = None  # {token: prob} for each position
+    token_logprobs: Optional[List[float]] = None
+    tokens: Optional[List[str]] = None
+    logits: Optional[Any] = None  # numpy array (num_tokens, vocab_size) — raw pre-softmax logits
+    vocab_size: Optional[int] = None
+
+
+@dataclass
+class BranchResult:
+    """Result from a single branch of branched generation."""
+    content: str
+    tokens_used: int
+    temperature: float
+    top_p: float
+
+
+@dataclass
+class BranchedLLMResponse:
+    """Response from branched generation — K outputs from one forward-pass loop."""
+    branches: List[BranchResult]
+    prompt_tokens: int
+    vocab_size: int
+
 
 class LLMClient:
     """Unified LLM client supporting local Ollama, Ollama Cloud, and OpenAI"""
@@ -26,6 +71,7 @@ class LLMClient:
         if self._async_client is None or self._async_client.is_closed:
             self._async_client = httpx.AsyncClient(
                 timeout=600.0,
+                follow_redirects=True,
                 limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
             )
         return self._async_client
@@ -71,7 +117,9 @@ class LLMClient:
     ) -> Tuple[str, int]:
         """Unified LLM call that routes to appropriate service"""
         async with self._semaphore:
-            if self.config["type"] == "ollama_cloud":
+            if self.config["type"] == "modal":
+                return await self._call_modal(messages, model, stop, **overrides)
+            elif self.config["type"] == "ollama_cloud":
                 return await self._call_ollama_cloud(messages, model, stop, **overrides)
             elif self.config["type"] == "openai":
                 return await self._call_openai(messages, model, stop, **overrides)
@@ -181,6 +229,200 @@ class LLMClient:
         except Exception as e:
             logger.error("local_ollama_failed", error=str(e), port=port, model=model)
             raise
+
+    # ── Modal (full logits) ─────────────────────────────────────────────
+
+    async def _modal_post_with_retry(self, url: str, payload: dict) -> dict:
+        """POST to Modal with retry on 303 (cold start) and 429 (rate limit)."""
+        client = await self._get_async_client()
+        last_err = None
+        for attempt, delay in enumerate([0] + _COLD_START_DELAYS):
+            if delay:
+                await asyncio.sleep(delay)
+            try:
+                resp = await client.post(url, json=payload)
+                resp.raise_for_status()
+                return resp.json()
+            except httpx.TimeoutException:
+                raise RuntimeError(f"Modal call timed out after {attempt + 1} attempts")
+            except httpx.HTTPStatusError as e:
+                last_err = e
+                if e.response.status_code in (303, 429, 502, 503):
+                    logger.warning("modal_retry", status=e.response.status_code,
+                                 attempt=attempt + 1, url=url)
+                    continue
+                body = e.response.text[:500] if e.response.text else ""
+                logger.error("modal_http_error", status=e.response.status_code, body=body)
+                raise RuntimeError(f"Modal returned HTTP {e.response.status_code}")
+        status = last_err.response.status_code if last_err else "unknown"
+        raise RuntimeError(f"Modal call failed after {len(_COLD_START_DELAYS) + 1} retries (last: {status})")
+
+    async def _call_modal(
+        self,
+        messages: List[Dict],
+        model: str,
+        stop: Optional[List[str]],
+        **overrides
+    ) -> Tuple[str, int]:
+        """Call Modal endpoint (text generation, no logits)."""
+        payload = {
+            "model": model,
+            "messages": messages,
+            "max_tokens": overrides.get("max_tokens", LLM_MAX_TOKENS),
+            "temperature": overrides.get("temperature", 0.5),
+            "return_logits": False,
+        }
+        if "top_p" in overrides:
+            payload["top_p"] = overrides["top_p"]
+        if stop:
+            payload["stop"] = stop
+
+        base = self._modal_url_for(model)
+        url = f"{base}/generate"
+
+        data = await self._modal_post_with_retry(url, payload)
+        content = data.get("content", "")
+        # Strip Qwen3 thinking blocks (inline or tagged)
+        content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+        if not content:
+            content = data.get("content", "").strip()
+        tokens = data.get("usage", {}).get("total_tokens", 0)
+        return content, tokens
+
+    def _modal_url_for(self, model: str) -> str:
+        """Return the Modal endpoint URL (single container serves all models)."""
+        return self.config["base_url"].rstrip("/")
+
+    async def call_llm_with_logits(
+        self,
+        messages: List[Dict],
+        model: str,
+        stop: Optional[List[str]] = None,
+        **overrides
+    ) -> LLMResponse:
+        """Generate text and return full raw logits (Modal only).
+
+        Returns an LLMResponse with .logits as a numpy array of shape
+        (num_generated_tokens, vocab_size) containing pre-softmax logits.
+        """
+        if self.config["type"] != "modal":
+            raise RuntimeError(
+                "call_llm_with_logits requires Modal deployment mode "
+                f"(current: {self.config['type']})"
+            )
+
+        payload = {
+            "model": model,
+            "messages": messages,
+            "max_tokens": overrides.get("max_tokens", LLM_MAX_TOKENS),
+            "temperature": overrides.get("temperature", 0.5),
+            "return_logits": True,
+        }
+        if "top_p" in overrides:
+            payload["top_p"] = overrides["top_p"]
+        if stop:
+            payload["stop"] = stop
+
+        async with self._semaphore:
+            base = self._modal_url_for(model)
+            url = f"{base}/generate"
+            data = await self._modal_post_with_retry(url, payload)
+
+        logits = None
+        vocab_size = data.get("vocab_size")
+        if "logits_b64" in data:
+            logits = np.frombuffer(
+                base64.b64decode(data["logits_b64"]), dtype=np.float32
+            ).reshape(data["logits_shape"])
+
+        return LLMResponse(
+            content=data.get("content", ""),
+            total_tokens=data.get("usage", {}).get("total_tokens", 0),
+            tokens=data.get("tokens"),
+            logits=logits,
+            vocab_size=vocab_size,
+        )
+
+    async def call_llm_branched(
+        self,
+        messages: List[Dict],
+        model: str,
+        branch_configs: List[Dict],
+        stop: Optional[List[str]] = None,
+        **overrides,
+    ) -> BranchedLLMResponse:
+        """Generate K branched outputs from a single autoregressive loop (Modal only).
+
+        Each branch_config is a dict with 'temperature' and 'top_p'.
+        All branches share the same prompt and KV cache prefix.
+        """
+        if self.config["type"] != "modal":
+            raise RuntimeError(
+                "call_llm_branched requires Modal deployment mode "
+                f"(current: {self.config['type']})"
+            )
+
+        payload = {
+            "model": model,
+            "messages": messages,
+            "branch_configs": branch_configs,
+            "max_tokens": overrides.get("max_tokens", LLM_MAX_TOKENS),
+        }
+        if stop:
+            payload["stop"] = stop
+
+        async with self._semaphore:
+            base = self._modal_url_for(model)
+            url = f"{base}/generate_branched"
+            data = await self._modal_post_with_retry(url, payload)
+
+        branches = []
+        for i, b in enumerate(data.get("branches", [])):
+            cfg = branch_configs[i] if i < len(branch_configs) else {}
+            branches.append(BranchResult(
+                content=b.get("content", ""),
+                tokens_used=b.get("tokens_used", 0),
+                temperature=cfg.get("temperature", 0.5),
+                top_p=cfg.get("top_p", 1.0),
+            ))
+
+        return BranchedLLMResponse(
+            branches=branches,
+            prompt_tokens=data.get("prompt_tokens", 0),
+            vocab_size=data.get("vocab_size", 0),
+        )
+
+    async def get_next_token_logits(
+        self,
+        messages: List[Dict],
+        continuation: str = "",
+        continuation_ids: Optional[List[int]] = None,
+    ) -> Tuple[np.ndarray, int]:
+        """Get raw logits for the next token position (Modal only).
+
+        Returns (logits_array, vocab_size) where logits_array has shape (vocab_size,).
+        Use this for step-by-step custom sampling loops.
+        """
+        if self.config["type"] != "modal":
+            raise RuntimeError("get_next_token_logits requires Modal deployment mode")
+
+        payload: Dict = {"messages": messages}
+        if continuation_ids is not None:
+            payload["continuation_ids"] = continuation_ids
+        elif continuation:
+            payload["continuation"] = continuation
+
+        async with self._semaphore:
+            url = f"{self.config['base_url'].rstrip('/')}/next_token_logits"
+            data = await self._modal_post_with_retry(url, payload)
+
+        logits = np.frombuffer(
+            base64.b64decode(data["logits_b64"]), dtype=np.float32
+        ).reshape(data["logits_shape"])
+
+        return logits, data.get("vocab_size", logits.shape[0])
+
+    # ── Response parsers ─────────────────────────────────────────────────
 
     def _parse_openai_response(self, data: Dict) -> Tuple[str, int]:
         """Parse OpenAI-compatible response format."""
