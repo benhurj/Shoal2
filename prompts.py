@@ -18,52 +18,109 @@ def build_system_prompt() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Planner: outputs a numbered list of sub-tasks
+# Stage 1: Planner + Role Designer (merged, 1× 9B call)
 # ---------------------------------------------------------------------------
-def build_planner_prompt(role_addendum: str = "") -> str:
+def build_planner_and_roles_prompt(query: str, k: int) -> str:
     tool_descriptions = _tool_descriptions()
-    role_block = f"\n\nYour approach: {role_addendum}" if role_addendum else ""
-    return f"""You are a task planner. Break the user request into a numbered checklist of sub-tasks.
+    tool_names = ", ".join(t.name.value for t in TOOL_REGISTRY.values())
+    return f"""You are a task planner and agent role designer.
+
+Given the user query, output:
+1. A base plan (numbered list of sub-tasks with tool hints)
+2. {k} distinct agent personas to tackle the query from different angles
 
 Available tools:
 {tool_descriptions}
 
+Output format (EXACTLY as shown, no extra text):
+
+PLAN:
+1. [TOOL] description
+2. [TOOL] description
+
+ROLE: role_name
+STYLE: precise
+TEMPERATURE: 0.10
+TOP_P: 0.80
+PLANNER: One sentence: how this role should plan.
+EXECUTOR: One sentence: how this role should execute.
+
+(repeat ROLE block {k} times)
+
 Rules:
-- Output ONLY a numbered list. No extra text.
-- Each item format: NUMBER. [TOOL] description
-- TOOL must be one of: calculator, search, datetime, or none
-- Use [none] if the sub-task needs no tool (e.g. reasoning).
-- Keep the list short (1-4 items).
-
-Examples:
-
-User: What is 5 * 20 and is the result greater than 50?
-1. [calculator] Calculate 5 * 20
-2. [none] Check if the result is greater than 50
-
-User: What is the weather in London?
-1. [search] Search for current weather in London
-
-User: What time is it and what is 100 / 4?
-1. [datetime] Get the current date and time
-2. [calculator] Calculate 100 divided by 4
-
-User: What was Apple stock price yesterday?
-1. [search] Search for Apple stock price yesterday
-{role_block}
-Now respond with ONLY a numbered list.
+- TOOL must be one of: {tool_names}, none
+- Role names: 1-3 words, underscores, lowercase
+- Each role must be genuinely different in approach
+- Tailor roles to the nature of the query
+- precise style: TEMPERATURE ~0.10, TOP_P ~0.80
+- balanced style: TEMPERATURE ~0.35, TOP_P ~0.88
+- exploratory style: TEMPERATURE ~0.70, TOP_P ~0.95
+- Keep plan to 1-3 steps
 """
 
 
 # ---------------------------------------------------------------------------
-# Executor: the ReAct worker that uses tools
+# Stage 2: Plan Adjuster (1× 9B call, outputs K adjusted plans)
+# ---------------------------------------------------------------------------
+def build_plan_adjuster_prompt(base_plan: list[dict], roles: list[dict]) -> str:
+    tool_names = ", ".join(t.name.value for t in TOOL_REGISTRY.values())
+    plan_text = "\n".join(
+        f"{i+1}. [{s['tool_hint']}] {s['task']}"
+        for i, s in enumerate(base_plan)
+    )
+    roles_text = "\n".join(
+        f"ROLE: {r['label']} — {r.get('executor_addendum', '')}"
+        for r in roles
+    )
+    k = len(roles)
+    return f"""You are a task planner. Customize the base plan for each agent role.
+
+Base plan:
+{plan_text}
+
+Agent roles:
+{roles_text}
+
+For each agent, output an adjusted version of the plan adapted to that role's approach.
+
+Output format (EXACTLY as shown, one block per role):
+
+AGENT: role_name
+1. [TOOL] adapted description
+2. [TOOL] adapted description
+
+Rules:
+- TOOL must be one of: {tool_names}, none
+- Keep to 3 steps max per agent
+- {k} AGENT blocks total, in the same order as the roles listed
+- No extra text, no explanation
+"""
+
+
+# ---------------------------------------------------------------------------
+# Stage 3a: Self-check (0.8B, max_tokens=16)
+# ---------------------------------------------------------------------------
+def build_self_check_prompt(query: str, history: str) -> str:
+    return f"""You are an agent reviewing your own work.
+
+Original query: {query}
+
+Your work so far:
+{history}
+
+Have you fully addressed every part of the original query?
+Answer with exactly YES or NO."""
+
+
+# ---------------------------------------------------------------------------
+# Executor: the ReAct worker that uses tools (unchanged)
 # ---------------------------------------------------------------------------
 def build_executor_prompt(task: str = "", history: str = "", feedback: str = "", role_addendum: str = "") -> str:
     tool_descriptions = _tool_descriptions()
 
     context_block = ""
     if task:
-        context_block += f"\n\nYOUR TASK: {task}\nYou MUST complete this exact task. Do NOT search for anything else."
+        context_block += f"\n\nYOUR TASK: {task}\nYou MUST complete this exact task. Do NOT deviate from it."
     if history:
         context_block += f"\n\nPrevious results:\n{history}"
     if feedback:
@@ -71,49 +128,52 @@ def build_executor_prompt(task: str = "", history: str = "", feedback: str = "",
     if role_addendum:
         context_block += f"\n\nYour approach: {role_addendum}"
 
+    tool_names = ", ".join(t.name.value for t in TOOL_REGISTRY.values())
+
     return f"""You are a task executor. You complete the given task using tools.
 Today's date: {date.today().strftime('%B %d, %Y')}.
 {context_block}
 
-Tools:
+Available tools:
 {tool_descriptions}
 
 Format — to use a tool:
 Action: <tool_name>
 Action Input: <input>
 
+where <tool_name> must be one of: {tool_names}
+
 Format — when done:
 Final Answer: <answer>
 
 RULES:
-- Action Input must be about YOUR TASK above. Nothing else.
+- Only use the tools listed above. Do NOT invent tool names.
+- Action Input must be relevant to YOUR TASK above. Nothing else.
 - Do NOT make up answers. Use a tool first, then answer from the Observation."""
 
 
 # ---------------------------------------------------------------------------
-# Evaluator: checks if the Executor completed a sub-task
+# Stage 4: Full evaluator (holistic 9B eval, max_tokens=128)
 # ---------------------------------------------------------------------------
-def build_evaluator_prompt(task: str, worker_output: str) -> str:
-    return f"""You are a strict evaluator. You are given a sub-task instruction and the output produced by a worker.
+def build_full_evaluator_prompt(query: str, agent_history: str) -> str:
+    return f"""You are a strict evaluator. An agent attempted to answer a user query by executing multiple sub-tasks.
 
-Determine if the worker completed the sub-task to a reasonable standard.
+Original query: {query}
 
-Sub-task: {task}
-
-Worker output: {worker_output}
+Agent's complete work:
+{agent_history}
 
 Rules:
-- PASS if the worker clearly addressed the task using evidence from tool observations.
-- FAIL if the answer is vague, unsupported, or just says it could not find the information.
-- FAIL if the answer contains specific numbers or facts with no supporting source or observation.
-- FAIL if the output is a raw tool Action/Input block rather than an actual answer.
+- PASS if the agent clearly addressed the full query with evidence from tool observations.
+- FAIL if the answer is incomplete, vague, or unsupported by observations.
+- FAIL if major parts of the query were not addressed.
+- FAIL if the output contains raw tool Action/Input blocks rather than synthesized answers.
 
-Respond with EXACTLY one of:
-- PASS
-- FAIL: <short reason why it failed>
+Your response MUST end with exactly one of these two lines (no other format accepted):
+PASS
+FAIL: <short reason>
 
-Do not output anything else.
-"""
+Output the verdict line immediately. Do not write a preamble."""
 
 
 # ---------------------------------------------------------------------------
@@ -128,6 +188,32 @@ Original user question: {query}
 
 Using the sub-task results above, write a clear, concise final answer to the user's original question. Do not mention sub-tasks or internal processes.
 """
+
+
+# ---------------------------------------------------------------------------
+# Unified evaluator: 9B issues PASS/FAIL for every candidate (1 call total)
+# ---------------------------------------------------------------------------
+def build_unified_evaluator_prompt(query: str, candidates: list[dict]) -> str:
+    n = len(candidates)
+    candidates_text = "\n\n".join(
+        f"Candidate {i} (role: {c['role_label']}):\n{c['history'][:500]}"
+        for i, c in enumerate(candidates)
+    )
+    return f"""You are a strict evaluator. Multiple agents attempted to answer a query.
+
+Query: {query}
+
+{candidates_text}
+
+Rules:
+- PASS if the candidate clearly addressed the full query with grounded, specific information from tool observations.
+- FAIL if the answer is incomplete, vague, unsupported, or contains raw Action/Input blocks instead of synthesized answers.
+
+Output one verdict per candidate, exactly in this format (no other text):
+VERDICT 0: PASS|FAIL
+VERDICT 1: PASS|FAIL
+...
+VERDICT {n - 1}: PASS|FAIL"""
 
 
 # ---------------------------------------------------------------------------
@@ -147,27 +233,4 @@ Your job:
 3. Compile a single, best answer that combines the strongest elements.
 
 Output ONLY the compiled answer. Do not mention agents, attempts, or evaluations.
-"""
-
-# ---------------------------------------------------------------------------
-# Role Designer: generates K agent personas tailored to the query
-# ---------------------------------------------------------------------------
-def build_role_designer_prompt(query: str, k: int) -> str:
-    return f"""You are a multi-agent role designer. Given a user query, generate {k} distinct agent personas that will each tackle the query from a different angle.
-
-User query: {query}
-
-For each agent, output a block in EXACTLY this format (repeat {k} times):
-
-ROLE: <short_role_name>
-STYLE: <precise|balanced|exploratory>
-PLANNER: <one sentence: how this role should plan and break down the task>
-EXECUTOR: <one sentence: how this role should execute and use tools>
-
-Rules:
-- Role names must be short (1-3 words, underscores only, no spaces)
-- STYLE must be exactly one of: precise, balanced, exploratory
-- Each persona must be genuinely different in approach
-- Tailor the personas to the nature of the query (e.g. financial queries need analyst/skeptic roles, coding queries need debugger/architect roles)
-- Output ONLY the {k} role blocks. No extra text, no numbering, no explanation.
 """

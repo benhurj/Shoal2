@@ -20,8 +20,8 @@ MODAL_ENDPOINT_URL = os.getenv("MODAL_ENDPOINT_URL")  # single L4 container (bot
 # ── Logprobs configuration (Together.ai) ──
 LOGPROBS_TOP_K = 5  # Number of top tokens to return logprobs for (0-20)
 
-# ── Worker LLM (runs Executor + Evaluator) ──
-WORKER_MODEL = "Qwen/Qwen3.5-0.8B"
+# ── Worker LLM (runs Executor) ──
+WORKER_MODEL = "HuggingFaceTB/SmolLM2-135M-Instruct"
 if DEPLOYMENT_MODE == "ollama_cloud":
     # Cloud mode - use API endpoints instead of local ports
     WORKER_PORTS = ["cloud-worker"]  # Single cloud endpoint
@@ -71,11 +71,22 @@ TOP_P_STD = 0.05
 # ── Ensemble configuration ──
 ENSEMBLE_K = 3  # Number of parallel agent loops
 
+# ── Many-samples architecture ──
+SAMPLES_PER_ROLE = 5   # N samples per role (many-samples path)
+WORKER_POOL_SIZE = 3   # K worker model copies; should match ENSEMBLE_K
+
+# ── Per-stage token limits ──
+PLANNER_MAX_TOKENS = 512
+EXECUTOR_MAX_TOKENS = 512
+SELF_CHECK_MAX_TOKENS = 16  # legacy: self-check (/agent endpoint only)
+EVALUATOR_MAX_TOKENS = 512
+COMPILER_MAX_TOKENS = 512
+
 # ── Agent loop limits ──
-REACT_MAX_ITERATIONS = 6       # Max tool loops per executor run
-MAX_PLAN_STEPS = 5             # Cap on planner sub-tasks
-MAX_EVALUATOR_RETRIES = 2     # Retries per sub-task before aborting
-MAX_CONCURRENT_LLM_CALLS = 3 # Semaphore limit for concurrent LLM requests
+REACT_MAX_ITERATIONS = 4       # Max tool loops per executor run
+MAX_PLAN_STEPS = 3             # Cap on planner sub-tasks
+MAX_AGENT_RETRIES = 1          # legacy: retry limit per agent (/agent endpoint)
+MAX_CONCURRENT_LLM_CALLS = 15  # Semaphore limit; raised for K×N parallel calls
 
 # ── Search tool ──
 SEARCH_TOP_N = 3          # Default number of pages to fetch per search

@@ -1,19 +1,27 @@
 # modal_server.py
-# Deploy: modal deploy modal_server.py
-# Requires: pip install modal && modal setup
+# Deploy: uv run modal deploy modal_server.py
 # Requires: modal secret create huggingface-secret HF_TOKEN=hf_xxx
 #
-# After deploy, Modal prints one endpoint URL. Set it in .env:
-#   MODAL_ENDPOINT_URL=https://<workspace>--shoal-dual-shoaldualmodel-serve.modal.run
+# Endpoints:
+#   POST /query              — run full Shoal pipeline, returns AgentResponse
+#   POST /next_token_logits  — raw next-token logits (for custom sampling loops)
+#   GET  /health             — liveness check
+
+import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import modal
 
-# ── Configuration ──
-WORKER_MODEL = "Qwen/Qwen3.5-0.8B"
+# ── Configuration ─────────────────────────────────────────────────────────────
+
+WORKER_MODEL = "HuggingFaceTB/SmolLM2-135M-Instruct"
 COMPILER_MODEL = "Qwen/Qwen3.5-9B"
+WORKER_POOL_SIZE = 3  # K model copies; each gets its own CUDA stream
 
 app = modal.App("shoal-dual")
 
+# Project source files are added to the image at /app (copy=False → mounted at runtime)
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .pip_install(
@@ -22,13 +30,27 @@ image = (
         "numpy",
         "accelerate",
         "fastapi[standard]",
+        "structlog",
+        "pydantic",
+        "python-dotenv",
+        "httpx",
+        "ddgs>=9.11.1",
+    )
+    .add_local_dir(
+        ".",
+        remote_path="/app",
+        ignore=[
+            ".git", ".venv", "__pycache__", ".pytest_cache",
+            "node_modules", "tests", ".env", "*.pyc", "*.pyo",
+            "uv.lock", ".claude",
+        ],
     )
 )
 
 hf_cache = modal.Volume.from_name("hf-cache", create_if_missing=True)
 
 
-# ── Shared logic ─────────────────────────────────────────────────────
+# ── Shared model-loading helpers ──────────────────────────────────────────────
 
 def _load_model(model_name):
     import torch
@@ -45,346 +67,304 @@ def _load_model(model_name):
     )
     model.eval()
     vocab_size = model.config.vocab_size
-    print(f"[shoal] Model loaded. vocab_size={vocab_size}, device={model.device}")
+    print(f"[shoal] Loaded {model_name}. vocab_size={vocab_size}, device={model.device}")
     return model, tokenizer, vocab_size
 
 
-def _build_app(models):
-    """Build FastAPI app with multi-model routing.
+def _apply_chat_template_safe(tokenizer, messages, **kwargs):
+    """Apply chat template, stripping unsupported kwargs for non-Qwen tokenizers."""
+    try:
+        return tokenizer.apply_chat_template(messages, **kwargs)
+    except TypeError:
+        kwargs.pop("enable_thinking", None)
+        return tokenizer.apply_chat_template(messages, **kwargs)
+
+
+# ── Generation primitive (module-level so InProcessLLMClient can call it) ─────
+
+class _Msg:
+    """Minimal message object with .model_dump() for _compute_generate."""
+    __slots__ = ("role", "content")
+
+    def __init__(self, role, content):
+        self.role = role
+        self.content = content
+
+    def model_dump(self):
+        return {"role": self.role, "content": self.content}
+
+
+class _Body:
+    """Minimal request struct that _compute_generate reads."""
+    __slots__ = ("messages", "max_tokens", "temperature", "top_p", "return_logits", "stop")
+
+    def __init__(self, messages, max_tokens, temperature, top_p, stop):
+        self.messages = messages
+        self.max_tokens = max_tokens
+        self.temperature = temperature
+        self.top_p = top_p
+        self.return_logits = False
+        self.stop = stop
+
+
+def _compute_generate(model, tokenizer, vocab_size, body):
+    """Standard generation. Safe to run in a ThreadPoolExecutor thread."""
+    import torch
+
+    messages = [m.model_dump() for m in body.messages]
+    input_text = _apply_chat_template_safe(
+        tokenizer, messages, tokenize=False, add_generation_prompt=True,
+        enable_thinking=False,
+    )
+    inputs = tokenizer(input_text, return_tensors="pt").to(model.device)
+    input_len = inputs.input_ids.shape[1]
+
+    gen_kwargs = dict(
+        **inputs,
+        max_new_tokens=body.max_tokens,
+        do_sample=body.temperature > 0,
+        return_dict_in_generate=True,
+    )
+    if body.temperature > 0:
+        gen_kwargs["temperature"] = body.temperature
+        gen_kwargs["top_p"] = body.top_p
+
+    with torch.no_grad():
+        outputs = model.generate(**gen_kwargs)
+
+    generated_ids = outputs.sequences[0][input_len:]
+    content = tokenizer.decode(generated_ids, skip_special_tokens=True)
+
+    if body.stop:
+        for s in body.stop:
+            idx = content.find(s)
+            if idx != -1:
+                content = content[:idx]
+
+    return {
+        "content": content,
+        "usage": {
+            "prompt_tokens": int(input_len),
+            "completion_tokens": len(generated_ids),
+            "total_tokens": int(input_len) + len(generated_ids),
+        },
+        "vocab_size": int(vocab_size),
+    }
+
+
+# ── Worker pool ───────────────────────────────────────────────────────────────
+
+class WorkerPool:
+    """K copies of the worker model, each on its own CUDA stream."""
+
+    def __init__(self, model_name, k):
+        import torch
+        from transformers import AutoTokenizer, AutoModelForCausalLM
+
+        print(f"[shoal] Initializing WorkerPool: {k} copies of {model_name}")
+        self.k = k
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.vocab_size = None
+        self.models = []
+        self.streams = []
+
+        for i in range(k):
+            print(f"[shoal] Loading worker copy {i}...")
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                torch_dtype=torch.float16,
+                device_map="auto",
+            )
+            model.eval()
+            if self.vocab_size is None:
+                self.vocab_size = model.config.vocab_size
+            self.models.append(model)
+            self.streams.append(torch.cuda.Stream())
+            mem_gb = torch.cuda.memory_allocated() / 1024 ** 3
+            print(f"[shoal] Worker copy {i} loaded. VRAM used so far: {mem_gb:.2f} GB")
+
+        self.executor = ThreadPoolExecutor(max_workers=k)
+        print(f"[shoal] WorkerPool ready. vocab_size={self.vocab_size}, k={k}")
+
+
+# ── In-process LLM client (replaces HTTP calls inside the pipeline) ────────────
+
+class InProcessLLMClient:
+    """Drop-in for agent_hybrid.llm_client — calls loaded models directly in-process.
+
+    Routes worker_idx calls to the WorkerPool (parallel CUDA streams).
+    Serializes compiler calls with a threading.Semaphore so only one
+    Qwen3.5-9B generate() runs at a time.
+    """
+
+    def __init__(self, models, worker_pool):
+        # models: {model_name: (model, tokenizer, vocab_size)}
+        self.models = models
+        self.worker_pool = worker_pool
+        self._executor = ThreadPoolExecutor(max_workers=20)
+        self._compiler_lock = threading.Semaphore(1)
+
+    async def call_llm(self, messages, model, stop=None, **overrides):
+        import asyncio
+        import re
+
+        worker_idx = overrides.pop("worker_idx", None)
+        overrides.pop("port", None)  # irrelevant in-process
+
+        max_tokens = overrides.get("max_tokens", 512)
+        temperature = overrides.get("temperature", 0.5)
+        top_p = overrides.get("top_p", 1.0)
+
+        msgs = [_Msg(m["role"], m["content"]) for m in messages]
+        body = _Body(msgs, max_tokens, temperature, top_p, stop)
+
+        loop = asyncio.get_running_loop()
+
+        if worker_idx is not None and self.worker_pool is not None:
+            pool_model = self.worker_pool.models[worker_idx]
+            pool_stream = self.worker_pool.streams[worker_idx]
+            pool_tokenizer = self.worker_pool.tokenizer
+            pool_vocab_size = self.worker_pool.vocab_size
+
+            def _run_worker():
+                import torch
+                with torch.cuda.stream(pool_stream):
+                    return _compute_generate(pool_model, pool_tokenizer, pool_vocab_size, body)
+
+            result = await loop.run_in_executor(self.worker_pool.executor, _run_worker)
+        else:
+            m_obj, tok, vs = self.models[model]
+
+            def _run_compiler():
+                with self._compiler_lock:
+                    return _compute_generate(m_obj, tok, vs, body)
+
+            result = await loop.run_in_executor(self._executor, _run_compiler)
+
+        content = result["content"]
+        # Strip Qwen3 thinking blocks
+        content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip() or content
+        tokens = result["usage"]["total_tokens"]
+        return content, tokens
+
+
+# ── FastAPI application ───────────────────────────────────────────────────────
+
+def _build_app(models, worker_pool, run_pipeline):
+    """Build the FastAPI app.
 
     Args:
-        models: dict mapping model_name -> (model, tokenizer, vocab_size)
+        models:       {model_name: (model, tokenizer, vocab_size)}
+        worker_pool:  WorkerPool instance
+        run_pipeline: async (query: str) -> AgentResponse
     """
+    import asyncio
     import base64
     import torch
     import numpy as np
     from fastapi import FastAPI, HTTPException
     from fastapi.responses import JSONResponse
-    from pydantic import BaseModel, Field
-    from typing import List, Optional, Dict, Any
+    from pydantic import BaseModel
+    from typing import List, Optional
 
-    # ── Request/response schemas for Swagger ──────────────────────────
+    class QueryRequest(BaseModel):
+        query: str
 
     class Message(BaseModel):
         role: str = "user"
-        content: str = "Hello"
-
-    class GenerateRequest(BaseModel):
-        model: str = Field(default=WORKER_MODEL, description="Model name")
-        messages: List[Message]
-        max_tokens: int = 512
-        temperature: float = 0.5
-        top_p: float = 1.0
-        return_logits: bool = False
-        stop: Optional[List[str]] = None
-
-    class BranchConfig(BaseModel):
-        temperature: float = 0.5
-        top_p: float = 1.0
-
-    class BranchedRequest(BaseModel):
-        model: str = Field(default=COMPILER_MODEL, description="Model name")
-        messages: List[Message]
-        branch_configs: List[BranchConfig]
-        max_tokens: int = 512
-        stop: Optional[List[str]] = None
+        content: str = ""
 
     class NextTokenRequest(BaseModel):
-        model: str = Field(default=WORKER_MODEL, description="Model name")
+        model: str = WORKER_MODEL
         messages: List[Message]
         continuation: str = ""
         continuation_ids: Optional[List[int]] = None
 
-    web_app = FastAPI(title="Shoal Dual-Model Server")
-    default_model = WORKER_MODEL
+    web_app = FastAPI(title="Shoal — Multi-Agent Ensemble")
 
     def _resolve(model_name):
         if model_name not in models:
             raise HTTPException(400, f"Unknown model: {model_name}. Available: {list(models.keys())}")
         return models[model_name]
 
-    @web_app.post("/generate")
-    async def generate(body: GenerateRequest):
-        model_name = body.model
-        model, tokenizer, vocab_size = _resolve(model_name)
+    # ── Pipeline endpoint ─────────────────────────────────────────────────────
 
-        messages = [m.model_dump() for m in body.messages]
-        max_tokens = body.max_tokens
-        temperature = body.temperature
-        top_p = body.top_p
-        return_logits = body.return_logits
-        stop = body.stop
+    @web_app.post("/query")
+    async def query_endpoint(body: QueryRequest):
+        """Run the full Shoal pipeline.
 
-        input_text = tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True,
-        )
-        inputs = tokenizer(input_text, return_tensors="pt").to(model.device)
-        input_len = inputs.input_ids.shape[1]
+        Stages:
+          1. Planner + Role Designer  (1× Qwen3.5-9B)
+          2. Plan Adjuster            (1× Qwen3.5-9B)
+          3. K×N executor samples     (SmolLM2-135M, K CUDA streams)
+          4. K best-of-N evaluators   (1× Qwen3.5-9B each)
+          5. Compiler                 (1× Qwen3.5-9B)
+        """
+        result = await run_pipeline(body.query)
+        return JSONResponse(result.model_dump())
 
-        gen_kwargs = dict(
-            **inputs,
-            max_new_tokens=max_tokens,
-            do_sample=temperature > 0,
-            return_dict_in_generate=True,
-        )
-        if temperature > 0:
-            gen_kwargs["temperature"] = temperature
-            gen_kwargs["top_p"] = top_p
-        if return_logits:
-            gen_kwargs["output_logits"] = True
-
-        with torch.no_grad():
-            outputs = model.generate(**gen_kwargs)
-
-        generated_ids = outputs.sequences[0][input_len:]
-        content = tokenizer.decode(generated_ids, skip_special_tokens=True)
-
-        if stop:
-            for s in stop:
-                idx = content.find(s)
-                if idx != -1:
-                    content = content[:idx]
-
-        tokens = [tokenizer.decode([t]) for t in generated_ids]
-
-        response = {
-            "content": content,
-            "tokens": tokens,
-            "usage": {
-                "prompt_tokens": int(input_len),
-                "completion_tokens": len(generated_ids),
-                "total_tokens": int(input_len) + len(generated_ids),
-            },
-            "vocab_size": int(vocab_size),
-        }
-
-        if return_logits and hasattr(outputs, "logits") and outputs.logits:
-            logits_array = (
-                torch.stack(outputs.logits).squeeze(1).cpu().float().numpy()
-            )
-            response["logits_b64"] = base64.b64encode(
-                logits_array.astype(np.float32).tobytes()
-            ).decode("ascii")
-            response["logits_shape"] = list(logits_array.shape)
-
-        return JSONResponse(response)
+    # ── Token logits endpoint ─────────────────────────────────────────────────
 
     @web_app.post("/next_token_logits")
     async def next_token_logits(body: NextTokenRequest):
+        """Return raw pre-softmax logits for the next token position."""
         model_name = body.model
         model, tokenizer, vocab_size = _resolve(model_name)
 
         messages = [m.model_dump() for m in body.messages]
-        continuation = body.continuation
-        continuation_ids = body.continuation_ids
-
-        input_text = tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True,
+        input_text = _apply_chat_template_safe(
+            tokenizer, messages, tokenize=False, add_generation_prompt=True,
+            enable_thinking=False,
         )
 
-        if continuation_ids is not None:
+        if body.continuation_ids is not None:
             base_ids = tokenizer(input_text, return_tensors="pt").input_ids
-            cont_ids = torch.tensor([continuation_ids], dtype=base_ids.dtype)
+            cont_ids = torch.tensor([body.continuation_ids], dtype=base_ids.dtype)
             input_ids = torch.cat([base_ids, cont_ids], dim=1).to(model.device)
             model_inputs = {"input_ids": input_ids}
         else:
-            if continuation:
-                input_text += continuation
+            if body.continuation:
+                input_text += body.continuation
             model_inputs = tokenizer(input_text, return_tensors="pt")
-            model_inputs = {
-                k: v.to(model.device) for k, v in model_inputs.items()
-            }
+            model_inputs = {k: v.to(model.device) for k, v in model_inputs.items()}
 
         with torch.no_grad():
             outputs = model(**model_inputs)
 
         logits = outputs.logits[0, -1].cpu().float().numpy()
-
-        response = {
-            "logits_b64": base64.b64encode(
-                logits.astype(np.float32).tobytes()
-            ).decode("ascii"),
+        return JSONResponse({
+            "logits_b64": base64.b64encode(logits.astype(np.float32).tobytes()).decode("ascii"),
             "logits_shape": [int(logits.shape[0])],
             "vocab_size": int(vocab_size),
-        }
-        return JSONResponse(response)
+        })
 
-    # ── Branched generation ───────────────────────────────────────────
-
-    def _top_p_sample(logits_1d, temperature, top_p):
-        """Apply temperature scaling + nucleus (top-p) sampling to a 1-D logit tensor.
-        Returns a single sampled token id (int).
-        """
-        if temperature <= 0:
-            return int(logits_1d.argmax().item())
-
-        scaled = logits_1d / temperature
-        probs = torch.softmax(scaled, dim=-1)
-
-        sorted_probs, sorted_idx = torch.sort(probs, descending=True)
-        cumsum = torch.cumsum(sorted_probs, dim=-1)
-
-        # Zero out tokens beyond the top-p threshold
-        mask = cumsum - sorted_probs > top_p
-        sorted_probs[mask] = 0.0
-        sorted_probs /= sorted_probs.sum()
-
-        chosen_pos = torch.multinomial(sorted_probs, num_samples=1)
-        return int(sorted_idx[chosen_pos].item())
-
-    @web_app.post("/generate_branched")
-    async def generate_branched(body: BranchedRequest):
-        model_name = body.model
-        model, tokenizer, vocab_size = _resolve(model_name)
-
-        messages = [m.model_dump() for m in body.messages]
-        branch_configs = [bc.model_dump() for bc in body.branch_configs]
-        max_tokens = body.max_tokens
-        stop = body.stop
-
-        if not branch_configs:
-            raise HTTPException(400, "branch_configs is required and must be non-empty")
-
-        K = len(branch_configs)
-
-        # Tokenize prompt once
-        input_text = tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True,
-        )
-        inputs = tokenizer(input_text, return_tensors="pt").to(model.device)
-        input_len = inputs.input_ids.shape[1]
-
-        # Initial forward pass — get logits + KV cache for the shared prompt
-        with torch.no_grad():
-            out = model(**inputs, use_cache=True)
-
-        logits = out.logits[0, -1]  # shape (vocab_size,)
-        cache = out.past_key_values  # DynamicCache or tuple of (K, V) per layer
-
-        # Per-branch state
-        branch_token_ids = [[] for _ in range(K)]  # generated token ids
-        branch_done = [False] * K
-        eos_id = tokenizer.eos_token_id
-
-        # Sample first token for each branch from shared logits
-        for b, cfg in enumerate(branch_configs):
-            tid = _top_p_sample(logits, cfg.get("temperature", 0.5), cfg.get("top_p", 1.0))
-            branch_token_ids[b].append(tid)
-            if tid == eos_id:
-                branch_done[b] = True
-
-        # Expand KV cache from batch=1 to batch=K
-        # Qwen3.5 uses Qwen3_5DynamicCache — a hybrid cache with
-        # key/value (attention), conv_states, and ssm_states (linear attn)
-        print(f"[shoal] Cache type: {type(cache).__name__}, K={K}")
-
-        # Expand key_cache / value_cache (attention layers)
-        for layer_idx in range(len(cache.key_cache)):
-            k = cache.key_cache[layer_idx]
-            v = cache.value_cache[layer_idx]
-            if k is not None:
-                cache.key_cache[layer_idx] = k.repeat(K, 1, 1, 1)
-            if v is not None:
-                cache.value_cache[layer_idx] = v.repeat(K, 1, 1, 1)
-
-        # Expand conv_states (linear attention layers — causal conv1d state)
-        if hasattr(cache, 'conv_states'):
-            for layer_idx in range(len(cache.conv_states)):
-                cs = cache.conv_states[layer_idx]
-                if cs is not None:
-                    # conv_state shape: (batch, channels, conv_width)
-                    cache.conv_states[layer_idx] = cs.repeat(K, 1, 1)
-
-        # Expand ssm_states (linear attention layers — recurrent/SSM state)
-        if hasattr(cache, 'ssm_states'):
-            for layer_idx in range(len(cache.ssm_states)):
-                ss = cache.ssm_states[layer_idx]
-                if ss is not None:
-                    # ssm_state shape: (batch, ...) — repeat along batch dim
-                    repeat_dims = [K] + [1] * (ss.dim() - 1)
-                    cache.ssm_states[layer_idx] = ss.repeat(*repeat_dims)
-
-        print(f"[shoal] Cache expanded to batch={K}")
-
-        # Autoregressive loop with batched forward passes
-        for step in range(1, max_tokens):
-            if all(branch_done):
-                break
-
-            # Build batched input: (K, 1) — last token per branch
-            next_ids = torch.tensor(
-                [[branch_token_ids[b][-1]] for b in range(K)],
-                dtype=torch.long, device=model.device,
-            )
-
-            with torch.no_grad():
-                out = model(input_ids=next_ids, past_key_values=cache, use_cache=True)
-
-            cache = out.past_key_values
-            all_logits = out.logits[:, -1, :]  # (K, vocab_size)
-
-            for b, cfg in enumerate(branch_configs):
-                if branch_done[b]:
-                    continue
-                tid = _top_p_sample(
-                    all_logits[b], cfg.get("temperature", 0.5), cfg.get("top_p", 1.0)
-                )
-                branch_token_ids[b].append(tid)
-
-                if tid == eos_id:
-                    branch_done[b] = True
-                    continue
-
-                # Check stop sequences
-                if stop:
-                    decoded_tail = tokenizer.decode(branch_token_ids[b][-20:], skip_special_tokens=True)
-                    for s in stop:
-                        if s in decoded_tail:
-                            branch_done[b] = True
-                            break
-
-        # Decode branches
-        branches = []
-        for b in range(K):
-            content = tokenizer.decode(branch_token_ids[b], skip_special_tokens=True)
-            # Trim at stop sequence
-            if stop:
-                for s in stop:
-                    idx = content.find(s)
-                    if idx != -1:
-                        content = content[:idx]
-            branches.append({
-                "content": content,
-                "tokens_used": len(branch_token_ids[b]),
-            })
-
-        response = {
-            "branches": branches,
-            "prompt_tokens": int(input_len),
-            "vocab_size": int(vocab_size),
-        }
-        return JSONResponse(response)
-
-    # ── Health ────────────────────────────────────────────────────────
+    # ── Health ────────────────────────────────────────────────────────────────
 
     @web_app.get("/health")
     async def health():
+        pool_info = None
+        if worker_pool is not None:
+            pool_info = {
+                "worker_copies": worker_pool.k,
+                "vocab_size": int(worker_pool.vocab_size),
+            }
         return {
             "status": "ok",
             "models": {name: int(vs) for name, (_, _, vs) in models.items()},
+            "worker_pool": pool_info,
         }
 
     return web_app
 
 
-# ── Single L4 container with both models ─────────────────────────────
+# ── Single L4 container: compiler + K worker copies ───────────────────────────
 
 @app.cls(
     gpu="L4",
     image=image,
     memory=32768,
     scaledown_window=3600,
-    timeout=600,
+    timeout=1200,
     max_containers=1,
     secrets=[modal.Secret.from_name("huggingface-secret")],
     volumes={"/root/.cache/huggingface": hf_cache},
@@ -393,14 +373,46 @@ class ShoalDualModel:
 
     @modal.enter()
     def load_models(self):
-        w_model, w_tok, w_vs = _load_model(WORKER_MODEL)
+        import torch
+
+        # Make project source files importable
+        sys.path.insert(0, "/app")
+
+        # Load compiler model (Qwen3.5-9B)
         c_model, c_tok, c_vs = _load_model(COMPILER_MODEL)
+
+        # Worker pool disabled — only needed for legacy run_agent path (worker_idx calls)
+        # run_agent_many_samples uses run_executor_direct which makes no LLM calls
+        # self.worker_pool = WorkerPool(WORKER_MODEL, k=WORKER_POOL_SIZE)
+        self.worker_pool = None
         hf_cache.commit()
+
         self.models = {
-            WORKER_MODEL: (w_model, w_tok, w_vs),
             COMPILER_MODEL: (c_model, c_tok, c_vs),
+            # WORKER_MODEL only needed for legacy run_agent path:
+            # WORKER_MODEL: (
+            #     self.worker_pool.models[0],
+            #     self.worker_pool.tokenizer,
+            #     self.worker_pool.vocab_size,
+            # ),
         }
+
+        # Create in-process LLM client and inject into agent_hybrid
+        self._inprocess_client = InProcessLLMClient(self.models, self.worker_pool)
+        import agent_hybrid
+        agent_hybrid.llm_client = self._inprocess_client
+        # Reduce pipeline load for single-L4 deployment (fit within 1200s timeout)
+        agent_hybrid.ENSEMBLE_K = 2
+        agent_hybrid.SAMPLES_PER_ROLE = 2
+        agent_hybrid.REACT_MAX_ITERATIONS = 2
+        agent_hybrid.WORKER_POOL_SIZE = WORKER_POOL_SIZE
+        self._run_pipeline = agent_hybrid.run_agent_many_samples
+
+        total_vram = torch.cuda.get_device_properties(0).total_memory / 1024 ** 3
+        used_vram = torch.cuda.memory_allocated() / 1024 ** 3
+        print(f"[shoal] All models loaded. VRAM: {used_vram:.2f} GB / {total_vram:.2f} GB")
+        print(f"[shoal] Pipeline ready. Endpoint: POST /query")
 
     @modal.asgi_app()
     def serve(self):
-        return _build_app(self.models)
+        return _build_app(self.models, self.worker_pool, self._run_pipeline)

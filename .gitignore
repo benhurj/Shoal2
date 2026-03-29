@@ -1,11 +1,44 @@
-# Python-generated files
+# Python
 __pycache__/
-*.py[oc]
-build/
+*.py[cod]
+*.pyo
+*.egg-info/
 dist/
+build/
 wheels/
-*.egg-info
 
 # Virtual environments
-.venv
+.venv/
 .env
+
+# uv
+.python-version
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Testing / Coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Logs and output
+*.log
+out.json
+test.json
+
+# Claude Code
+.claude/
+
+# Secrets
+.env.local
+.env.production

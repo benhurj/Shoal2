@@ -3,7 +3,26 @@
     "allow": [
       "Bash(curl -s -X POST http://localhost:8000/query -H \"Content-Type: application/json\" -d '{\"\"query\"\": \"\"what was kyndryl stock price on 02/03/2026? what will it be on 05/03/2026?\"\"}')",
       "Bash(uv run uvicorn main:app --host 0.0.0.0 --port 8000 --reload)",
-      "Bash(curl -s -X POST http://localhost:8000/agent -H \"Content-Type: application/json\" -d '{\"\"query\"\": \"\"what was kyndryl stock price on 02/03/2026? what will it be on 05/03/2026?\"\"}')"
+      "Bash(curl -s -X POST http://localhost:8000/agent -H \"Content-Type: application/json\" -d '{\"\"query\"\": \"\"what was kyndryl stock price on 02/03/2026? what will it be on 05/03/2026?\"\"}')",
+      "Bash(git -C \"C:\\\\Users\\\\moham\\\\OneDrive\\\\Documents\\\\Shoal2\" show*)",
+      "Bash(git -C \"C:\\\\Users\\\\moham\\\\OneDrive\\\\Documents\\\\Shoal2\" diff main feature/inverted_pendulum_sim --stat)",
+      "Bash(git -C \"C:\\\\Users\\\\moham\\\\OneDrive\\\\Documents\\\\Shoal2\" log main..feature/inverted_pendulum_sim --oneline)",
+      "Bash(git -C \"C:\\\\Users\\\\moham\\\\OneDrive\\\\Documents\\\\Shoal2\" show b14de78:README.md | head -100)",
+      "Bash(git -C \"C:\\\\Users\\\\moham\\\\OneDrive\\\\Documents\\\\Shoal2\" show ccb1074 --stat | head -50)",
+      "WebSearch",
+      "Bash(uv run:*)",
+      "Bash(curl:*)",
+      "Bash(netstat:*)",
+      "Bash(modal --version)",
+      "WebFetch(domain:api.github.com)",
+      "Bash(cd /tmp)",
+      "Bash(unzip -q monaspace.zip)",
+      "Bash(curl -s -X POST http://localhost:8000/agent -H \"Content-Type: application/json\" -d '{\"\"\"\"query\"\"\"\": \"\"\"\"plan my holiday to spain at the end of the month\"\"\"\"}')",
+      "Bash(python -m json.tool)",
+      "Bash(PYTHONIOENCODING=utf-8 timeout 10 modal app logs shoal-dual)"
     ]
-  }
+  },
+  "outputStyle": "default",
+  "spinnerTipsEnabled": true,
+  "prefersReducedMotion": false
 }

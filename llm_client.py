@@ -116,9 +116,10 @@ class LLMClient:
         **overrides
     ) -> Tuple[str, int]:
         """Unified LLM call that routes to appropriate service"""
+        worker_idx = overrides.pop("worker_idx", None)
         async with self._semaphore:
             if self.config["type"] == "modal":
-                return await self._call_modal(messages, model, stop, **overrides)
+                return await self._call_modal(messages, model, stop, worker_idx=worker_idx, **overrides)
             elif self.config["type"] == "ollama_cloud":
                 return await self._call_ollama_cloud(messages, model, stop, **overrides)
             elif self.config["type"] == "openai":
@@ -262,6 +263,7 @@ class LLMClient:
         messages: List[Dict],
         model: str,
         stop: Optional[List[str]],
+        worker_idx: Optional[int] = None,
         **overrides
     ) -> Tuple[str, int]:
         """Call Modal endpoint (text generation, no logits)."""
@@ -276,6 +278,8 @@ class LLMClient:
             payload["top_p"] = overrides["top_p"]
         if stop:
             payload["stop"] = stop
+        if worker_idx is not None:
+            payload["worker_idx"] = worker_idx
 
         base = self._modal_url_for(model)
         url = f"{base}/generate"
@@ -349,6 +353,7 @@ class LLMClient:
         model: str,
         branch_configs: List[Dict],
         stop: Optional[List[str]] = None,
+        worker_idx: Optional[int] = None,
         **overrides,
     ) -> BranchedLLMResponse:
         """Generate K branched outputs from a single autoregressive loop (Modal only).
@@ -370,6 +375,8 @@ class LLMClient:
         }
         if stop:
             payload["stop"] = stop
+        if worker_idx is not None:
+            payload["worker_idx"] = worker_idx
 
         async with self._semaphore:
             base = self._modal_url_for(model)
