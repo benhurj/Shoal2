@@ -35,6 +35,7 @@ image = (
         "python-dotenv",
         "httpx",
         "ddgs>=9.11.1",
+        "mcp>=1.0.0",
     )
     .add_local_dir(
         ".",
@@ -348,10 +349,18 @@ def _build_app(models, worker_pool, run_pipeline):
                 "worker_copies": worker_pool.k,
                 "vocab_size": int(worker_pool.vocab_size),
             }
+        import agent_hybrid as _ah
+        mcp_tools = None
+        if _ah.mcp_client is not None:
+            try:
+                mcp_tools = [t["name"] for t in await _ah.mcp_client.list_tools()]
+            except Exception:
+                mcp_tools = "error"
         return {
             "status": "ok",
             "models": {name: int(vs) for name, (_, _, vs) in models.items()},
             "worker_pool": pool_info,
+            "mcp_tools": mcp_tools,
         }
 
     return web_app
@@ -372,7 +381,8 @@ def _build_app(models, worker_pool, run_pipeline):
 class ShoalDualModel:
 
     @modal.enter()
-    def load_models(self):
+    async def load_models(self):
+        import asyncio
         import torch
 
         # Make project source files importable
@@ -381,20 +391,17 @@ class ShoalDualModel:
         # Load compiler model (Qwen3.5-9B)
         c_model, c_tok, c_vs = _load_model(COMPILER_MODEL)
 
-        # Worker pool disabled — only needed for legacy run_agent path (worker_idx calls)
-        # run_agent_many_samples uses run_executor_direct which makes no LLM calls
-        # self.worker_pool = WorkerPool(WORKER_MODEL, k=WORKER_POOL_SIZE)
-        self.worker_pool = None
+        # Worker pool — K copies of SmolLM2-135M for parallel follow-up decisions
+        self.worker_pool = WorkerPool(WORKER_MODEL, k=WORKER_POOL_SIZE)
         hf_cache.commit()
 
         self.models = {
             COMPILER_MODEL: (c_model, c_tok, c_vs),
-            # WORKER_MODEL only needed for legacy run_agent path:
-            # WORKER_MODEL: (
-            #     self.worker_pool.models[0],
-            #     self.worker_pool.tokenizer,
-            #     self.worker_pool.vocab_size,
-            # ),
+            WORKER_MODEL: (
+                self.worker_pool.models[0],
+                self.worker_pool.tokenizer,
+                self.worker_pool.vocab_size,
+            ),
         }
 
         # Create in-process LLM client and inject into agent_hybrid
@@ -402,11 +409,26 @@ class ShoalDualModel:
         import agent_hybrid
         agent_hybrid.llm_client = self._inprocess_client
         # Reduce pipeline load for single-L4 deployment (fit within 1200s timeout)
-        agent_hybrid.ENSEMBLE_K = 2
-        agent_hybrid.SAMPLES_PER_ROLE = 2
+        agent_hybrid.ENSEMBLE_K = WORKER_POOL_SIZE
+        agent_hybrid.SAMPLES_PER_ROLE = 1          # N=1; follow-ups replace N>1
         agent_hybrid.REACT_MAX_ITERATIONS = 2
         agent_hybrid.WORKER_POOL_SIZE = WORKER_POOL_SIZE
+        agent_hybrid.MAX_FOLLOW_UPS = 2
+        agent_hybrid.FOLLOW_UP_MAX_TOKENS = 64
         self._run_pipeline = agent_hybrid.run_agent_many_samples
+
+        # Start MCP tool server subprocess for richer tool descriptions
+        from tools.mcp_client import MCPClient
+        self._mcp_client = MCPClient("/app/tools/mcp_server.py")
+        try:
+            await self._mcp_client.start()
+            # Warm the tool cache so first request doesn't block
+            await self._mcp_client.list_tools()
+            agent_hybrid.mcp_client = self._mcp_client
+            print("[shoal] MCP tool server started.")
+        except Exception as e:
+            print(f"[shoal] MCP tool server failed to start (degraded mode): {e}")
+            self._mcp_client = None
 
         total_vram = torch.cuda.get_device_properties(0).total_memory / 1024 ** 3
         used_vram = torch.cuda.memory_allocated() / 1024 ** 3

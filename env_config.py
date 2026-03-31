@@ -68,6 +68,15 @@ def get_llm_config():
             "type": "modal",
             "base_url": CloudConfig.modal_endpoint_url(),
         }
+    elif mode == "hybrid":
+        # Worker: any OpenAI-compatible local server (Ollama or bitnet.cpp)
+        # Compiler: Modal
+        return {
+            "type": "hybrid",
+            "worker_url": os.getenv("LOCAL_WORKER_URL", "http://localhost:11434/v1"),
+            "worker_api_key": os.getenv("LOCAL_WORKER_API_KEY", "none"),
+            "modal_url": CloudConfig.modal_endpoint_url() or "",
+        }
     else:
         return {
             "type": "local",

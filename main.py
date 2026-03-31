@@ -1,11 +1,33 @@
 # main.py
+from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from agent_hybrid import run_agent, run_agent_many_samples
 from models import AgentResponse
 
-app = FastAPI(title="Shoal — Multi-Agent Ensemble")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    from config import DEPLOYMENT_MODE
+    import agent_hybrid
+    mcp = None
+    if DEPLOYMENT_MODE in ("local", "hybrid"):
+        from tools.mcp_client import MCPClient
+        mcp = MCPClient()
+        try:
+            await mcp.start()
+            await mcp.list_tools()
+            agent_hybrid.mcp_client = mcp
+            print("[shoal] MCP tool server started.")
+        except Exception as e:
+            print(f"[shoal] MCP tool server failed to start (degraded): {e}")
+    yield
+    if mcp:
+        await mcp.stop()
+
+
+app = FastAPI(title="Shoal — Multi-Agent Ensemble", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,

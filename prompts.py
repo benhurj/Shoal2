@@ -91,10 +91,62 @@ AGENT: role_name
 
 Rules:
 - TOOL must be one of: {tool_names}, none
+- Use calculator ONLY when the step description is an actual Python arithmetic expression (e.g. "330 * 0.9"). Do NOT assign calculator to text descriptions or data-gathering steps.
 - Keep to 3 steps max per agent
 - {k} AGENT blocks total, in the same order as the roles listed
 - No extra text, no explanation
 """
+
+
+# ---------------------------------------------------------------------------
+# Stage 3: Follow-up decision (135M, max_tokens=64)
+# ---------------------------------------------------------------------------
+def build_followup_decision_prompt(
+    task: str,
+    tool_hint: str,
+    observation: str,
+    tool_descriptions: str | None = None,
+) -> list[dict]:
+    """Two-message prompt for SmolLM2-135M-Instruct.
+
+    Returns a messages list ready for call_llm.
+    The model must output either:
+        DONE
+    or:
+        FOLLOWUP
+        TOOL: <tool_name>
+        INPUT: <query>
+
+    tool_descriptions: if provided (from MCPClient), used instead of bare tool names.
+    """
+    if tool_descriptions:
+        tool_info = f"Tools:\n{tool_descriptions}"
+    else:
+        tool_names = ", ".join(t.name.value for t in TOOL_REGISTRY.values())
+        tool_info = f"Tools: {tool_names}"
+
+    obs_truncated = observation[:600]
+    return [
+        {
+            "role": "system",
+            "content": (
+                "You are a decision agent. Given a task and a tool result, "
+                "decide if the result is sufficient.\n"
+                f"{tool_info}\n\n"
+                "If sufficient, reply exactly: DONE\n"
+                "If not sufficient, reply exactly:\n"
+                "FOLLOWUP\nTOOL: <tool_name>\nINPUT: <input>"
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"Task: {task}\n"
+                f"Tool used: {tool_hint}\n"
+                f"Result: {obs_truncated}"
+            ),
+        },
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -195,19 +247,29 @@ Using the sub-task results above, write a clear, concise final answer to the use
 # ---------------------------------------------------------------------------
 def build_unified_evaluator_prompt(query: str, candidates: list[dict]) -> str:
     n = len(candidates)
+
+    def _fmt_history(history: str) -> str:
+        """Per-step truncation: keep up to 800 chars per step, 3000 total."""
+        steps = history.split("\n\n")
+        parts = [s[:800] for s in steps]
+        combined = "\n\n".join(parts)
+        return combined[:3000]
+
     candidates_text = "\n\n".join(
-        f"Candidate {i} (role: {c['role_label']}):\n{c['history'][:500]}"
+        f"Candidate {i} (role: {c['role_label']}):\n{_fmt_history(c['history'])}"
         for i, c in enumerate(candidates)
     )
-    return f"""You are a strict evaluator. Multiple agents attempted to answer a query.
+    return f"""You are an evaluator. Multiple agents collected information to answer a query.
+Each candidate shows raw tool observations (search results, calculations, etc.).
 
 Query: {query}
 
 {candidates_text}
 
 Rules:
-- PASS if the candidate clearly addressed the full query with grounded, specific information from tool observations.
-- FAIL if the answer is incomplete, vague, unsupported, or contains raw Action/Input blocks instead of synthesized answers.
+- PASS if the tool observations contain specific, grounded data that covers the query (numbers, facts, comparisons as relevant).
+- FAIL if key information needed to answer the query is clearly absent from the observations.
+- FAIL if the observations show only errors or "(no tool assigned)" with no useful data.
 
 Output one verdict per candidate, exactly in this format (no other text):
 VERDICT 0: PASS|FAIL

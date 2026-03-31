@@ -120,6 +120,12 @@ class LLMClient:
         async with self._semaphore:
             if self.config["type"] == "modal":
                 return await self._call_modal(messages, model, stop, worker_idx=worker_idx, **overrides)
+            elif self.config["type"] == "hybrid":
+                from config import WORKER_MODEL
+                if model == WORKER_MODEL:
+                    return await self._call_local_openai_compat(messages, model, stop, **overrides)
+                else:
+                    return await self._call_modal(messages, model, stop, **overrides)
             elif self.config["type"] == "ollama_cloud":
                 return await self._call_ollama_cloud(messages, model, stop, **overrides)
             elif self.config["type"] == "openai":
@@ -231,6 +237,32 @@ class LLMClient:
             logger.error("local_ollama_failed", error=str(e), port=port, model=model)
             raise
 
+    # ── Local OpenAI-compatible server (Ollama /v1) ──────────────────────
+
+    async def _call_local_openai_compat(
+        self,
+        messages: List[Dict],
+        model: str,
+        stop: Optional[List[str]],
+        **overrides,
+    ) -> Tuple[str, int]:
+        """Call a local Ollama server at LOCAL_WORKER_URL (e.g. http://localhost:11434/v1)."""
+        if stop:
+            overrides["stop"] = stop
+        payload = self._build_openai_payload(messages, model, **overrides)
+        url = f"{self.config['worker_url'].rstrip('/')}/chat/completions"
+        api_key = self.config.get("worker_api_key", "none")
+        headers = {"Authorization": f"Bearer {api_key}"}
+        client = await self._get_async_client()
+        try:
+            resp = await client.post(url, json=payload, headers=headers)
+            resp.raise_for_status()
+        except httpx.TimeoutException:
+            raise RuntimeError(f"Local worker timed out (url={url}, model={model})")
+        except httpx.HTTPStatusError as e:
+            raise RuntimeError(f"Local worker returned HTTP {e.response.status_code} (url={url})")
+        return self._parse_openai_response(resp.json())
+
     # ── Modal (full logits) ─────────────────────────────────────────────
 
     async def _modal_post_with_retry(self, url: str, payload: dict) -> dict:
@@ -295,7 +327,8 @@ class LLMClient:
 
     def _modal_url_for(self, model: str) -> str:
         """Return the Modal endpoint URL (single container serves all models)."""
-        return self.config["base_url"].rstrip("/")
+        url = self.config.get("modal_url") or self.config.get("base_url", "")
+        return url.rstrip("/")
 
     async def call_llm_with_logits(
         self,

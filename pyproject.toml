@@ -8,6 +8,7 @@ dependencies = [
     "ddgs>=9.11.1",
     "fastapi>=0.133.1",
     "httpx>=0.28.1",
+    "mcp>=1.0.0",
     "numpy>=1.26.0",
     "pydantic>=2.12.5",
     "python-dotenv>=1.2.2",

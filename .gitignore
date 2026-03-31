@@ -36,6 +36,9 @@ htmlcov/
 out.json
 test.json
 
+# Pipeline artifacts (test runs, eval traces)
+artifacts/
+
 # Claude Code
 .claude/
 

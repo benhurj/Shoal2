@@ -6,7 +6,9 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ── Deployment Mode ──
-DEPLOYMENT_MODE = "modal"  # Options: "local", "ollama_cloud", "openai", "together", "modal"
+DEPLOYMENT_MODE = os.getenv("DEPLOYMENT_MODE", "modal")
+# Options: "local", "ollama_cloud", "openai", "together", "modal", "hybrid"
+# "hybrid": small worker model runs locally via Ollama, compiler on Modal
 
 # Cloud API configuration (loaded from .env)
 OLLAMA_CLOUD_API_KEY = os.getenv("OLLAMA_CLOUD_API_KEY")
@@ -21,26 +23,31 @@ MODAL_ENDPOINT_URL = os.getenv("MODAL_ENDPOINT_URL")  # single L4 container (bot
 LOGPROBS_TOP_K = 5  # Number of top tokens to return logprobs for (0-20)
 
 # ── Worker LLM (runs Executor) ──
-WORKER_MODEL = "HuggingFaceTB/SmolLM2-135M-Instruct"
+# In hybrid mode the worker runs on a local Ollama server.
+# LOCAL_WORKER_MODEL must match the model name registered in Ollama.
+if DEPLOYMENT_MODE == "hybrid":
+    WORKER_MODEL = os.getenv("LOCAL_WORKER_MODEL", "smollm2:135m-instruct")
+else:
+    WORKER_MODEL = "HuggingFaceTB/SmolLM2-135M-Instruct"
+
 if DEPLOYMENT_MODE == "ollama_cloud":
-    # Cloud mode - use API endpoints instead of local ports
-    WORKER_PORTS = ["cloud-worker"]  # Single cloud endpoint
-    WORKER_API_URLS = [f"{OLLAMA_CLOUD_BASE_URL}/v1"]  # Cloud API URL
+    WORKER_PORTS = ["cloud-worker"]
+    WORKER_API_URLS = [f"{OLLAMA_CLOUD_BASE_URL}/v1"]
 elif DEPLOYMENT_MODE == "openai":
-    # OpenAI mode - use OpenAI API
     WORKER_PORTS = ["openai-worker"]
     WORKER_API_URLS = [f"{OPENAI_BASE_URL}"]
 elif DEPLOYMENT_MODE == "together":
-    # Together.ai mode
     WORKER_PORTS = ["together-worker"]
     WORKER_API_URLS = [f"{TOGETHER_BASE_URL}"]
 elif DEPLOYMENT_MODE == "modal":
-    # Modal mode - single L4 container with both models
     WORKER_PORTS = ["modal-worker"]
     WORKER_API_URLS = [f"{MODAL_ENDPOINT_URL}"]
+elif DEPLOYMENT_MODE == "hybrid":
+    # URL set via LOCAL_WORKER_URL; port/path handled by llm_client hybrid routing
+    WORKER_PORTS = ["hybrid-worker"]
+    WORKER_API_URLS = [os.getenv("LOCAL_WORKER_URL", "http://localhost:11434/v1")]
 else:
-    # Local mode - use local Ollama instances
-    WORKER_PORTS = [11434]  # K=1 instance for testing
+    WORKER_PORTS = [11434]
 LLM_MAX_TOKENS = 4096
 
 # ── Compiler LLM (runs Planner + Compiler) ──
@@ -74,6 +81,8 @@ ENSEMBLE_K = 3  # Number of parallel agent loops
 # ── Many-samples architecture ──
 SAMPLES_PER_ROLE = 5   # N samples per role (many-samples path)
 WORKER_POOL_SIZE = 3   # K worker model copies; should match ENSEMBLE_K
+MAX_FOLLOW_UPS = 2     # Max 135M follow-up decisions per plan step
+FOLLOW_UP_MAX_TOKENS = 64  # Token budget for 135M decision output
 
 # ── Per-stage token limits ──
 PLANNER_MAX_TOKENS = 512

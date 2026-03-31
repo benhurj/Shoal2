@@ -11,6 +11,7 @@ from config import (
     MAX_AGENT_RETRIES, ENSEMBLE_K,
     COMPILER_TEMPERATURE, COMPILER_TOP_P,
     SAMPLES_PER_ROLE, WORKER_POOL_SIZE,
+    MAX_FOLLOW_UPS, FOLLOW_UP_MAX_TOKENS,
 )
 from models import (
     ToolCall, ToolName, AgentStep, AgentResponse,
@@ -21,12 +22,17 @@ from prompts import (
     build_planner_and_roles_prompt, build_plan_adjuster_prompt,
     build_self_check_prompt, build_full_evaluator_prompt,
     build_executor_prompt, build_compiler_prompt,
-    build_unified_evaluator_prompt,
+    build_unified_evaluator_prompt, build_followup_decision_prompt,
 )
 from roles import _parse_roles, _FALLBACK_ROLES
 from llm_client import llm_client
 
 logger = structlog.get_logger()
+
+# MCP tool client — injected at runtime by modal_server.py or main.py.
+# When set, follow-up decisions use MCP tool descriptions and call tools
+# through the MCP server subprocess.
+mcp_client = None
 
 
 # ---------------------------------------------------------------------------
@@ -392,6 +398,178 @@ async def run_executor_direct(
 
 
 # ---------------------------------------------------------------------------
+# Follow-up executor helpers
+# ---------------------------------------------------------------------------
+def _resolve_tool(tool_hint: str):
+    """Resolve a tool_hint string to (tool_instance, ToolName) or (None, None)."""
+    if tool_hint == "none":
+        return None, None
+    try:
+        tool_name = ToolName(tool_hint.lower())
+        tool = TOOL_REGISTRY.get(tool_name)
+        return tool, tool_name
+    except ValueError:
+        return None, None
+
+
+def parse_followup_decision(raw: str) -> dict | None:
+    """Parse 135M follow-up decision output. Returns None → treat as DONE.
+
+    Expected formats:
+        DONE
+    or:
+        FOLLOWUP
+        TOOL: search
+        INPUT: refined query
+    """
+    raw = raw.strip()
+    has_followup = bool(re.search(r'\bFOLLOWUP\b', raw, re.IGNORECASE))
+    has_done = bool(re.search(r'\bDONE\b', raw, re.IGNORECASE))
+
+    if has_followup:
+        tool_match = re.search(r'TOOL:\s*(\w+)', raw, re.IGNORECASE)
+        input_match = re.search(r'INPUT:\s*(.+?)(?:\n|$)', raw, re.IGNORECASE | re.DOTALL)
+        if tool_match and input_match:
+            raw_name = tool_match.group(1).strip().lower()
+            tool, tool_name = _resolve_tool(raw_name)
+            if tool:
+                return {
+                    "action": "FOLLOWUP",
+                    "tool_name": tool_name,
+                    "tool_name_str": raw_name,   # plain string for MCP calls
+                    "tool": tool,
+                    "input": input_match.group(1).strip(),
+                }
+    if has_done:
+        return {"action": "DONE"}
+    return None  # Unparseable → caller treats as DONE
+
+
+# ---------------------------------------------------------------------------
+# Stage 3b: Follow-up executor (135M per-step decisions, K parallel streams)
+# ---------------------------------------------------------------------------
+async def run_executor_with_followup(
+    plan: list[dict],
+    persona: str,
+    query: str,
+    worker_idx: int = 0,
+    **_params,
+) -> tuple[str, list[AgentStep], int]:
+    """Execute plan steps with 135M follow-up decisions.
+
+    For each plan step:
+      1. Call the tool directly (same as run_executor_direct)
+      2. Ask 135M: DONE or FOLLOWUP?
+      3. If FOLLOWUP, execute the suggested tool call and ask again
+      4. Cap at MAX_FOLLOW_UPS per step
+
+    Degrades gracefully to run_executor_direct behaviour if 135M call fails.
+    worker_idx routes to a dedicated CUDA stream in the WorkerPool.
+    """
+    lines: list[str] = []
+    all_steps: list[AgentStep] = []
+    total_tokens = 0
+
+    # Fetch MCP tool descriptions once for all follow-up prompts in this run
+    _tool_descs: str | None = None
+    if mcp_client is not None:
+        try:
+            _tool_descs = await mcp_client.tool_descriptions()
+        except Exception as e:
+            logger.warning("mcp_tool_descriptions_failed", error=str(e))
+
+    for step_info in plan:
+        task = step_info["task"]
+        tool_hint = step_info.get("tool_hint", "none")
+        tool, tool_name = _resolve_tool(tool_hint)
+
+        # Initial tool call (always via TOOL_REGISTRY for speed)
+        if tool:
+            # Guard: calculator only accepts numeric Python expressions.
+            # If the plan step description is text (as when the 9B planner
+            # writes e.g. "[calculator] Aggregate data…"), skip the call and
+            # leave a helpful observation so 135M can suggest a real expression.
+            if tool_name == ToolName.CALCULATOR:
+                import ast as _ast
+                try:
+                    _ast.parse(task.strip(), mode='eval')
+                    _skip_calculator = False
+                except SyntaxError:
+                    _skip_calculator = True
+            else:
+                _skip_calculator = False
+
+            if _skip_calculator:
+                observation = "(calculator needs a numeric expression — provide one in a follow-up)"
+                all_steps.append(AgentStep(iteration=1, thought=task))
+            else:
+                try:
+                    observation = await tool.execute(task)
+                except Exception as e:
+                    observation = f"tool error: {e}"
+                all_steps.append(AgentStep(
+                    iteration=1, thought="",
+                    action=ToolCall(tool=tool_name, input=task),
+                    observation=observation,
+                ))
+        else:
+            observation = "(no tool assigned)"
+            all_steps.append(AgentStep(iteration=1, thought=task))
+
+        # Follow-up loop
+        for follow_up_i in range(MAX_FOLLOW_UPS):
+            messages = build_followup_decision_prompt(
+                task, tool_hint, observation, tool_descriptions=_tool_descs
+            )
+            try:
+                raw_output, tokens = await llm_client.call_llm(
+                    messages, WORKER_MODEL,
+                    worker_idx=worker_idx % WORKER_POOL_SIZE,
+                    max_tokens=FOLLOW_UP_MAX_TOKENS,
+                    temperature=0.1,
+                    top_p=0.8,
+                )
+                total_tokens += tokens
+            except Exception as e:
+                logger.warning("followup_135m_failed", error=str(e), step=task[:40])
+                break
+
+            logger.info("followup_decision", worker_idx=worker_idx,
+                        follow_up_i=follow_up_i, raw=raw_output.strip()[:60])
+
+            decision = parse_followup_decision(raw_output)
+            if decision is None or decision["action"] == "DONE":
+                break
+
+            # Execute follow-up: prefer MCP client, fall back to TOOL_REGISTRY
+            fu_tool_name = decision["tool_name"]
+            fu_input = decision["input"]
+            if mcp_client is not None:
+                try:
+                    fu_observation = await mcp_client.call_tool(
+                        decision["tool_name_str"], fu_input
+                    )
+                except Exception as e:
+                    fu_observation = f"tool error: {e}"
+            else:
+                try:
+                    fu_observation = await decision["tool"].execute(fu_input)
+                except Exception as e:
+                    fu_observation = f"tool error: {e}"
+
+            all_steps.append(AgentStep(
+                iteration=follow_up_i + 2, thought="follow-up",
+                action=ToolCall(tool=fu_tool_name, input=fu_input),
+                observation=fu_observation,
+            ))
+            observation = fu_observation  # pass latest result to next decision
+
+        lines.append(f"[{tool_hint}] {task}:\n{observation}")
+
+    return "\n\n".join(lines), all_steps, total_tokens
+
+
+# ---------------------------------------------------------------------------
 # Stage 4: Holistic 9B evaluator (1 call per agent)
 # ---------------------------------------------------------------------------
 async def run_evaluator_full(query: str, agent_history: str) -> tuple[EvaluationResult, int]:
@@ -646,16 +824,17 @@ async def run_agent_many_samples(query: str) -> AgentResponse:
         logger.warning("plan_adjuster_failed_fallback", error=repr(e))
         plans = [list(base_plan) for _ in roles]
 
-    # Stage 3: K×N direct executions — tools called straight from the plan
+    # Stage 3: K executors with 135M follow-up decisions, one per role (parallel CUDA streams)
     async def run_one_sample(role_idx: int, sample_idx: int, plan: list[dict], role: dict):
         persona = role.get("executor_addendum", "")
-        history, steps, tokens = await run_executor_direct(plan, persona, query)
+        history, steps, tokens = await run_executor_with_followup(
+            plan, persona, query, worker_idx=role_idx,
+        )
         return history, steps, tokens
 
     sample_tasks = [
-        run_one_sample(i, j, plans[i], roles[i])
+        run_one_sample(i, 0, plans[i], roles[i])
         for i in range(ENSEMBLE_K)
-        for j in range(SAMPLES_PER_ROLE)
     ]
 
     t0 = time.monotonic()
