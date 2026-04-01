@@ -1,5 +1,6 @@
 # agent_hybrid.py
 import asyncio
+import random
 import re
 import time
 import structlog
@@ -12,6 +13,7 @@ from config import (
     COMPILER_TEMPERATURE, COMPILER_TOP_P,
     SAMPLES_PER_ROLE, WORKER_POOL_SIZE,
     MAX_FOLLOW_UPS, FOLLOW_UP_MAX_TOKENS,
+    TEMPERATURE_MEAN, TEMPERATURE_STD,
 )
 from models import (
     ToolCall, ToolName, AgentStep, AgentResponse,
@@ -453,6 +455,7 @@ async def run_executor_with_followup(
     persona: str,
     query: str,
     worker_idx: int = 0,
+    followup_temperature: float = TEMPERATURE_MEAN,
     **_params,
 ) -> tuple[str, list[AgentStep], int]:
     """Execute plan steps with 135M follow-up decisions.
@@ -526,8 +529,8 @@ async def run_executor_with_followup(
                     messages, WORKER_MODEL,
                     worker_idx=worker_idx % WORKER_POOL_SIZE,
                     max_tokens=FOLLOW_UP_MAX_TOKENS,
-                    temperature=0.1,
-                    top_p=0.8,
+                    temperature=followup_temperature,
+                    top_p=0.9,
                 )
                 total_tokens += tokens
             except Exception as e:
@@ -824,17 +827,20 @@ async def run_agent_many_samples(query: str) -> AgentResponse:
         logger.warning("plan_adjuster_failed_fallback", error=repr(e))
         plans = [list(base_plan) for _ in roles]
 
-    # Stage 3: K executors with 135M follow-up decisions, one per role (parallel CUDA streams)
+    # Stage 3: K×N executors with 135M follow-up decisions (parallel CUDA streams)
+    # N samples per role share the same CUDA stream (worker_idx=role_idx); roles run in parallel.
     async def run_one_sample(role_idx: int, sample_idx: int, plan: list[dict], role: dict):
         persona = role.get("executor_addendum", "")
+        temp = max(0.05, random.gauss(TEMPERATURE_MEAN, TEMPERATURE_STD))
         history, steps, tokens = await run_executor_with_followup(
-            plan, persona, query, worker_idx=role_idx,
+            plan, persona, query, worker_idx=role_idx, followup_temperature=temp,
         )
         return history, steps, tokens
 
     sample_tasks = [
-        run_one_sample(i, 0, plans[i], roles[i])
+        run_one_sample(i, j, plans[i], roles[i])
         for i in range(ENSEMBLE_K)
+        for j in range(SAMPLES_PER_ROLE)
     ]
 
     t0 = time.monotonic()

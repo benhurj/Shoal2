@@ -12,6 +12,16 @@ def _make_roles(k):
     ]
 
 
+def _all_pass_verdicts():
+    n = config.ENSEMBLE_K * config.SAMPLES_PER_ROLE
+    return ([{"passed": True, "reason": "correct"}] * n, 40)
+
+
+def _all_fail_verdicts():
+    n = config.ENSEMBLE_K * config.SAMPLES_PER_ROLE
+    return ([{"passed": False, "reason": "wrong"}] * n, 40)
+
+
 @pytest.mark.asyncio
 async def test_run_agent_many_samples_returns_agent_response():
     """run_agent_many_samples returns a valid AgentResponse with expected fields."""
@@ -21,8 +31,8 @@ async def test_run_agent_many_samples_returns_agent_response():
 
     with patch("agent_hybrid.run_planner_and_roles", new=AsyncMock(return_value=(base_plan, roles, 100))), \
          patch("agent_hybrid.run_plan_adjuster", new=AsyncMock(return_value=(plans, 80))), \
-         patch("agent_hybrid.run_agent_executor_simple", new=AsyncMock(return_value=("history text", [], 30))), \
-         patch("agent_hybrid.run_evaluator_best_of_n", new=AsyncMock(return_value=(0, "GOOD", 40))), \
+         patch("agent_hybrid.run_executor_with_followup", new=AsyncMock(return_value=("history text", [], 30))), \
+         patch("agent_hybrid.run_evaluator_unified", new=AsyncMock(return_value=_all_pass_verdicts())), \
          patch("agent_hybrid.run_compiler", new=AsyncMock(return_value=("The final answer.", 60))):
 
         result = await run_agent_many_samples("test query")
@@ -36,24 +46,24 @@ async def test_run_agent_many_samples_returns_agent_response():
 
 @pytest.mark.asyncio
 async def test_run_agent_many_samples_executor_and_eval_call_counts():
-    """K×N executor instances are launched and K evaluators are called."""
+    """K×N executor instances are launched and 1 unified evaluator call is made."""
     base_plan = [{"task": "do something", "tool_hint": "none"}]
     roles = _make_roles(config.ENSEMBLE_K)
     plans = [base_plan] * config.ENSEMBLE_K
 
     mock_executor = AsyncMock(return_value=("history", [], 10))
-    mock_eval = AsyncMock(return_value=(0, "GOOD", 20))
+    mock_eval = AsyncMock(return_value=_all_pass_verdicts())
 
     with patch("agent_hybrid.run_planner_and_roles", new=AsyncMock(return_value=(base_plan, roles, 50))), \
          patch("agent_hybrid.run_plan_adjuster", new=AsyncMock(return_value=(plans, 40))), \
-         patch("agent_hybrid.run_agent_executor_simple", new=mock_executor), \
-         patch("agent_hybrid.run_evaluator_best_of_n", new=mock_eval), \
+         patch("agent_hybrid.run_executor_with_followup", new=mock_executor), \
+         patch("agent_hybrid.run_evaluator_unified", new=mock_eval), \
          patch("agent_hybrid.run_compiler", new=AsyncMock(return_value=("answer", 30))):
 
         await run_agent_many_samples("test query")
 
     assert mock_executor.call_count == config.ENSEMBLE_K * config.SAMPLES_PER_ROLE
-    assert mock_eval.call_count == config.ENSEMBLE_K
+    assert mock_eval.call_count == 1
 
 
 @pytest.mark.asyncio
@@ -64,8 +74,8 @@ async def test_run_agent_many_samples_planner_failure_fallback():
 
     with patch("agent_hybrid.run_planner_and_roles", side_effect=Exception("planner error")), \
          patch("agent_hybrid.run_plan_adjuster", new=AsyncMock(return_value=(plans, 40))), \
-         patch("agent_hybrid.run_agent_executor_simple", new=AsyncMock(return_value=("history", [], 10))), \
-         patch("agent_hybrid.run_evaluator_best_of_n", new=AsyncMock(return_value=(0, "GOOD", 20))), \
+         patch("agent_hybrid.run_executor_with_followup", new=AsyncMock(return_value=("history", [], 10))), \
+         patch("agent_hybrid.run_evaluator_unified", new=AsyncMock(return_value=_all_pass_verdicts())), \
          patch("agent_hybrid.run_compiler", new=AsyncMock(return_value=("answer", 30))):
 
         result = await run_agent_many_samples("test query")
@@ -75,19 +85,19 @@ async def test_run_agent_many_samples_planner_failure_fallback():
 
 
 @pytest.mark.asyncio
-async def test_run_agent_many_samples_poor_quality_marked_fail():
-    """Roles with POOR quality get passed=False in ensemble results."""
+async def test_run_agent_many_samples_all_fail_uses_fallback_compiler():
+    """When all candidates fail evaluation, compiler still receives them as fallback."""
     base_plan = [{"task": "task", "tool_hint": "none"}]
     roles = _make_roles(config.ENSEMBLE_K)
     plans = [base_plan] * config.ENSEMBLE_K
 
     with patch("agent_hybrid.run_planner_and_roles", new=AsyncMock(return_value=(base_plan, roles, 50))), \
          patch("agent_hybrid.run_plan_adjuster", new=AsyncMock(return_value=(plans, 40))), \
-         patch("agent_hybrid.run_agent_executor_simple", new=AsyncMock(return_value=("history", [], 10))), \
-         patch("agent_hybrid.run_evaluator_best_of_n", new=AsyncMock(return_value=(0, "POOR", 20))), \
-         patch("agent_hybrid.run_compiler", new=AsyncMock(return_value=("answer", 30))):
+         patch("agent_hybrid.run_executor_with_followup", new=AsyncMock(return_value=("history", [], 10))), \
+         patch("agent_hybrid.run_evaluator_unified", new=AsyncMock(return_value=_all_fail_verdicts())), \
+         patch("agent_hybrid.run_compiler", new=AsyncMock(return_value=("answer", 30))) as mock_compiler:
 
         result = await run_agent_many_samples("test query")
 
-    sub = result.sub_task_results[0]
-    assert all(r.evaluation and not r.evaluation.passed for r in sub.ensemble_results)
+    assert result.success is True
+    mock_compiler.assert_called_once()

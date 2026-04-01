@@ -1,6 +1,6 @@
 import pytest
 from unittest.mock import AsyncMock, patch
-from agent_hybrid import run_evaluator_full, run_evaluator_best_of_n
+from agent_hybrid import run_evaluator_full, run_evaluator_unified
 from models import EvaluationResult
 
 
@@ -48,58 +48,55 @@ async def test_evaluator_fail_case_insensitive():
 
 
 # ---------------------------------------------------------------------------
-# run_evaluator_best_of_n tests
+# run_evaluator_unified tests
 # ---------------------------------------------------------------------------
 
-@pytest.mark.asyncio
-async def test_evaluator_best_of_n_selects_correct():
-    with patch("agent_hybrid.llm_client") as mock:
-        mock.call_llm = AsyncMock(return_value=("BEST: 2\nQUALITY: GOOD\nREASON: Most complete.", 50))
-        idx, quality, tokens = await run_evaluator_best_of_n(
-            "test query", "analyst", ["ans 0", "ans 1", "ans 2"]
-        )
-        assert idx == 2
-        assert quality == "GOOD"
-        assert tokens == 50
+def _make_candidates(n):
+    return [{"history": f"answer {i}", "role_label": f"role_{i}"} for i in range(n)]
 
 
 @pytest.mark.asyncio
-async def test_evaluator_best_of_n_parse_failure_defaults_zero():
+async def test_evaluator_unified_all_pass():
     with patch("agent_hybrid.llm_client") as mock:
-        mock.call_llm = AsyncMock(return_value=("The second one looks good.", 50))
-        idx, quality, tokens = await run_evaluator_best_of_n(
-            "test query", "analyst", ["ans 0", "ans 1", "ans 2"]
-        )
-        assert idx == 0
-        assert quality == "FAIR"
+        mock.call_llm = AsyncMock(return_value=(
+            "VERDICT 0: PASS - correct\nVERDICT 1: PASS - correct\nVERDICT 2: PASS - correct", 80
+        ))
+        verdicts, tokens = await run_evaluator_unified("query", _make_candidates(3))
+        assert all(v["passed"] for v in verdicts)
+        assert tokens == 80
 
 
 @pytest.mark.asyncio
-async def test_evaluator_best_of_n_out_of_range_defaults_zero():
+async def test_evaluator_unified_mixed():
     with patch("agent_hybrid.llm_client") as mock:
-        mock.call_llm = AsyncMock(return_value=("BEST: 99\nQUALITY: GOOD\nREASON: x.", 50))
-        idx, quality, tokens = await run_evaluator_best_of_n(
-            "test query", "analyst", ["ans 0", "ans 1"]
-        )
-        assert idx == 0
+        mock.call_llm = AsyncMock(return_value=(
+            "VERDICT 0: PASS - good\nVERDICT 1: FAIL - wrong\nVERDICT 2: PASS - good", 80
+        ))
+        verdicts, tokens = await run_evaluator_unified("query", _make_candidates(3))
+        assert verdicts[0]["passed"] is True
+        assert verdicts[1]["passed"] is False
+        assert verdicts[2]["passed"] is True
 
 
 @pytest.mark.asyncio
-async def test_evaluator_best_of_n_poor_quality():
+async def test_evaluator_unified_unparseable_defaults_fail():
     with patch("agent_hybrid.llm_client") as mock:
-        mock.call_llm = AsyncMock(return_value=("BEST: 0\nQUALITY: POOR\nREASON: weak.", 50))
-        idx, quality, tokens = await run_evaluator_best_of_n(
-            "query", "role", ["only one answer"]
-        )
-        assert quality == "POOR"
+        mock.call_llm = AsyncMock(return_value=("Looks okay to me.", 40))
+        verdicts, tokens = await run_evaluator_unified("query", _make_candidates(2))
+        assert all(not v["passed"] for v in verdicts)
 
 
 @pytest.mark.asyncio
-async def test_evaluator_best_of_n_case_insensitive_quality():
+async def test_evaluator_unified_reason_captured():
     with patch("agent_hybrid.llm_client") as mock:
-        mock.call_llm = AsyncMock(return_value=("BEST: 1\nQUALITY: fair\nREASON: ok.", 50))
-        idx, quality, tokens = await run_evaluator_best_of_n(
-            "query", "role", ["ans 0", "ans 1"]
-        )
-        assert idx == 1
-        assert quality == "FAIR"
+        mock.call_llm = AsyncMock(return_value=("VERDICT 0: FAIL - missing units", 40))
+        verdicts, _ = await run_evaluator_unified("query", _make_candidates(1))
+        assert "missing units" in verdicts[0]["reason"]
+
+
+@pytest.mark.asyncio
+async def test_evaluator_unified_returns_one_verdict_per_candidate():
+    with patch("agent_hybrid.llm_client") as mock:
+        mock.call_llm = AsyncMock(return_value=("VERDICT 0: PASS", 40))
+        verdicts, _ = await run_evaluator_unified("query", _make_candidates(4))
+        assert len(verdicts) == 4

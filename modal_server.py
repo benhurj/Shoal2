@@ -275,6 +275,16 @@ def _build_app(models, worker_pool, run_pipeline):
         role: str = "user"
         content: str = ""
 
+    class GenerateRequest(BaseModel):
+        model: str = WORKER_MODEL
+        messages: List[Message]
+        max_tokens: int = 512
+        temperature: float = 0.5
+        top_p: float = 1.0
+        stop: Optional[List[str]] = None
+        worker_idx: Optional[int] = None
+        return_logits: bool = False
+
     class NextTokenRequest(BaseModel):
         model: str = WORKER_MODEL
         messages: List[Message]
@@ -303,6 +313,36 @@ def _build_app(models, worker_pool, run_pipeline):
         """
         result = await run_pipeline(body.query)
         return JSONResponse(result.model_dump())
+
+    # ── Per-model generation endpoint (used by local server in modal mode) ───────
+
+    @web_app.post("/generate")
+    async def generate_endpoint(body: GenerateRequest):
+        """Single-model text generation. Routes worker_idx calls to the WorkerPool."""
+        import asyncio, torch
+        loop = asyncio.get_running_loop()
+
+        if body.worker_idx is not None and worker_pool is not None:
+            idx = body.worker_idx % worker_pool.k
+            pool_model = worker_pool.models[idx]
+            pool_stream = worker_pool.streams[idx]
+            pool_tokenizer = worker_pool.tokenizer
+            pool_vocab_size = worker_pool.vocab_size
+
+            def _run_worker():
+                with torch.cuda.stream(pool_stream):
+                    return _compute_generate(pool_model, pool_tokenizer, pool_vocab_size, body)
+
+            result = await loop.run_in_executor(worker_pool.executor, _run_worker)
+        else:
+            m_obj, tok, vs = _resolve(body.model)
+
+            def _run_compiler():
+                return _compute_generate(m_obj, tok, vs, body)
+
+            result = await loop.run_in_executor(None, _run_compiler)
+
+        return JSONResponse(result)
 
     # ── Token logits endpoint ─────────────────────────────────────────────────
 
