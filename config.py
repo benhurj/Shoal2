@@ -99,4 +99,4 @@ MAX_CONCURRENT_LLM_CALLS = 15  # Semaphore limit; raised for K×N parallel calls
 
 # ── Search tool ──
 SEARCH_TOP_N = 3          # Default number of pages to fetch per search
-SEARCH_MAX_CHARS = 2000   # Max characters per page (truncation guard)
+SEARCH_MAX_CHARS = 4000   # Max characters per page (truncation guard)

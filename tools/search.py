@@ -42,7 +42,7 @@ class SearchTool(BaseTool):
         try:
             resp = await client.get(
                 f"https://r.jina.ai/{url}",
-                timeout=10,
+                timeout=20,
                 headers={"Accept": "text/plain"},
                 follow_redirects=True,
             )

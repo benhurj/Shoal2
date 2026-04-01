@@ -488,31 +488,45 @@ async def run_executor_with_followup(
 
         # Initial tool call (always via TOOL_REGISTRY for speed)
         if tool:
-            # Guard: calculator only accepts numeric Python expressions.
-            # If the plan step description is text (as when the 9B planner
-            # writes e.g. "[calculator] Aggregate data…"), skip the call and
-            # leave a helpful observation so 135M can suggest a real expression.
+            # Calculator guard: needs a valid Python expression.
+            # Try the task directly, then strip common natural-language prefixes
+            # (e.g. "Calculate 17 * 23" → "17 * 23") before giving up.
             if tool_name == ToolName.CALCULATOR:
-                import ast as _ast
-                try:
-                    _ast.parse(task.strip(), mode='eval')
-                    _skip_calculator = False
-                except SyntaxError:
-                    _skip_calculator = True
+                import ast as _ast, re as _re
+                _calc_input = task.strip()
+                _skip_calculator = True
+                for _candidate in [
+                    _calc_input,
+                    _re.sub(
+                        r'^(?:calculate|compute|evaluate|what\s+is|what\'s|find|determine)\s*:?\s*',
+                        '', _calc_input, flags=_re.IGNORECASE,
+                    ).rstrip('?. '),
+                ]:
+                    try:
+                        _ast.parse(_candidate.strip(), mode='eval')
+                        _calc_input = _candidate.strip()
+                        _skip_calculator = False
+                        break
+                    except SyntaxError:
+                        continue
             else:
                 _skip_calculator = False
 
             if _skip_calculator:
-                observation = "(calculator needs a numeric expression — provide one in a follow-up)"
+                observation = (
+                    f"(calculator skipped: '{task[:80]}' is not a Python expression. "
+                    "Use FOLLOWUP with TOOL: calculator and INPUT: the numeric expression.)"
+                )
                 all_steps.append(AgentStep(iteration=1, thought=task))
             else:
+                _tool_input = _calc_input if tool_name == ToolName.CALCULATOR else task
                 try:
-                    observation = await tool.execute(task)
+                    observation = await tool.execute(_tool_input)
                 except Exception as e:
                     observation = f"tool error: {e}"
                 all_steps.append(AgentStep(
                     iteration=1, thought="",
-                    action=ToolCall(tool=tool_name, input=task),
+                    action=ToolCall(tool=tool_name, input=_tool_input),
                     observation=observation,
                 ))
         else:

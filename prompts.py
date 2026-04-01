@@ -49,6 +49,9 @@ EXECUTOR: One sentence: how this role should execute.
 
 Rules:
 - TOOL must be one of: {tool_names}, none
+- For [calculator] steps the description MUST be a valid Python arithmetic expression (e.g. "17 * 23", "(144/12)*7"). Never write natural language like "calculate the result".
+- For [search] steps the description is the search query string.
+- For [datetime] steps write "now".
 - Role names: 1-3 words, underscores, lowercase
 - Each role must be genuinely different in approach
 - Tailor roles to the nature of the query
@@ -130,12 +133,19 @@ def build_followup_decision_prompt(
         {
             "role": "system",
             "content": (
-                "You are a decision agent. Given a task and a tool result, "
-                "decide if the result is sufficient.\n"
+                "You decide if a tool result answers the task. Reply with EXACTLY:\n"
+                "  DONE\n"
+                "or:\n"
+                "  FOLLOWUP\n"
+                "  TOOL: <tool_name>\n"
+                "  INPUT: <value>\n\n"
                 f"{tool_info}\n\n"
-                "If sufficient, reply exactly: DONE\n"
-                "If not sufficient, reply exactly:\n"
-                "FOLLOWUP\nTOOL: <tool_name>\nINPUT: <input>"
+                "Use DONE only when the result directly contains the answer (a number, fact, or date).\n"
+                "Use FOLLOWUP when:\n"
+                "  - Result says 'not a Python expression' or 'skipped' → TOOL: calculator, INPUT: the numeric expression extracted from the task (digits and operators only, e.g. '17 * 23')\n"
+                "  - Result is an error or empty → retry with a corrected input\n"
+                "  - Result is a web page and a calculation is still needed\n"
+                "For calculator INPUT use only digits and operators (+,-,*,/,**,%). No words."
             ),
         },
         {
