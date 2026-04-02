@@ -89,7 +89,7 @@ PLANNER_MAX_TOKENS = 768
 EXECUTOR_MAX_TOKENS = 512
 SELF_CHECK_MAX_TOKENS = 16  # legacy: self-check (/agent endpoint only)
 EVALUATOR_MAX_TOKENS = 512  # 15 VERDICT lines needs ~300 tokens + reasoning
-COMPILER_MAX_TOKENS = 2048
+COMPILER_MAX_TOKENS = 2500
 
 # ── Agent loop limits ──
 REACT_MAX_ITERATIONS = 4       # Max tool loops per executor run
