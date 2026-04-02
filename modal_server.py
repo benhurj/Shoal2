@@ -15,7 +15,7 @@ import modal
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-WORKER_MODEL = "HuggingFaceTB/SmolLM2-135M-Instruct"
+WORKER_MODEL = "HuggingFaceTB/SmolLM2-360M-Instruct"
 COMPILER_MODEL = "Qwen/Qwen3.5-9B"
 WORKER_POOL_SIZE = 3  # K model copies; each gets its own CUDA stream
 
@@ -413,7 +413,7 @@ def _build_app(models, worker_pool, run_pipeline):
     image=image,
     memory=32768,
     scaledown_window=3600,
-    timeout=1200,
+    timeout=1800,
     max_containers=1,
     secrets=[modal.Secret.from_name("huggingface-secret")],
     volumes={"/root/.cache/huggingface": hf_cache},
@@ -450,7 +450,7 @@ class ShoalDualModel:
         agent_hybrid.llm_client = self._inprocess_client
         # Reduce pipeline load for single-L4 deployment (fit within 1200s timeout)
         agent_hybrid.ENSEMBLE_K = WORKER_POOL_SIZE
-        agent_hybrid.SAMPLES_PER_ROLE = 1          # N=1; follow-ups replace N>1
+        agent_hybrid.SAMPLES_PER_ROLE = 3
         agent_hybrid.REACT_MAX_ITERATIONS = 2
         agent_hybrid.WORKER_POOL_SIZE = WORKER_POOL_SIZE
         agent_hybrid.MAX_FOLLOW_UPS = 2

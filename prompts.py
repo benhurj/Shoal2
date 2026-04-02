@@ -52,6 +52,7 @@ Rules:
 - For [calculator] steps the description MUST be a valid Python arithmetic expression (e.g. "17 * 23", "(144/12)*7"). Never write natural language like "calculate the result".
 - For [search] steps the description is the search query string.
 - For [datetime] steps write "now".
+- Do NOT include [none] reasoning-only steps — only include steps that actually call a tool.
 - Role names: 1-3 words, underscores, lowercase
 - Each role must be genuinely different in approach
 - Tailor roles to the nature of the query
@@ -89,12 +90,15 @@ For each agent, output an adjusted version of the plan adapted to that role's ap
 Output format (EXACTLY as shown, one block per role):
 
 AGENT: role_name
-1. [TOOL] adapted description
-2. [TOOL] adapted description
+1. [search] adapted search query
+2. [calculator] 330 * 0.9
+3. [datetime] now
 
 Rules:
-- TOOL must be one of: {tool_names}, none
-- Use calculator ONLY when the step description is an actual Python arithmetic expression (e.g. "330 * 0.9"). Do NOT assign calculator to text descriptions or data-gathering steps.
+- Replace the tool name in brackets with one of: {tool_names}, none
+- Use [search] for web lookups, [calculator] for numeric expressions only, [datetime] for current time
+- Do NOT include [none] steps — only include steps that call an actual tool
+- Use [calculator] ONLY when the description is an actual Python expression (digits and operators). Never use it for text.
 - Keep to 3 steps max per agent
 - {k} AGENT blocks total, in the same order as the roles listed
 - No extra text, no explanation
@@ -133,27 +137,22 @@ def build_followup_decision_prompt(
         {
             "role": "system",
             "content": (
-                "You decide if a tool result answers the task. Reply with EXACTLY:\n"
-                "  DONE\n"
-                "or:\n"
-                "  FOLLOWUP\n"
-                "  TOOL: <tool_name>\n"
-                "  INPUT: <value>\n\n"
-                f"{tool_info}\n\n"
-                "Use DONE only when the result directly contains the answer (a number, fact, or date).\n"
-                "Use FOLLOWUP when:\n"
-                "  - Result says 'not a Python expression' or 'skipped' → TOOL: calculator, INPUT: the numeric expression extracted from the task (digits and operators only, e.g. '17 * 23')\n"
-                "  - Result is an error or empty → retry with a corrected input\n"
-                "  - Result is a web page and a calculation is still needed\n"
-                "For calculator INPUT use only digits and operators (+,-,*,/,**,%). No words."
+                "You are a decision oracle. Output ONE word only: DONE or FOLLOWUP.\n"
+                "Output DONE if the result contains specific facts, numbers, or text relevant to the task.\n"
+                "Output FOLLOWUP only if the result is an error, empty, or says 'skipped'.\n"
+                "If FOLLOWUP, add on the next two lines:\n"
+                "TOOL: <name>\n"
+                "INPUT: <value>\n\n"
+                f"{tool_info}"
             ),
         },
         {
             "role": "user",
             "content": (
                 f"Task: {task}\n"
-                f"Tool used: {tool_hint}\n"
-                f"Result: {obs_truncated}"
+                f"Tool: {tool_hint}\n"
+                f"Result: {obs_truncated}\n\n"
+                "Reply DONE or FOLLOWUP:"
             ),
         },
     ]
@@ -269,17 +268,16 @@ def build_unified_evaluator_prompt(query: str, candidates: list[dict]) -> str:
         f"Candidate {i} (role: {c['role_label']}):\n{_fmt_history(c['history'])}"
         for i, c in enumerate(candidates)
     )
-    return f"""You are an evaluator. Multiple agents collected information to answer a query.
-Each candidate shows raw tool observations (search results, calculations, etc.).
+    return f"""You are an evaluator. Multiple agents collected raw web search results to help answer a query.
 
 Query: {query}
 
 {candidates_text}
 
 Rules:
-- PASS if the tool observations contain specific, grounded data that covers the query (numbers, facts, comparisons as relevant).
-- FAIL if key information needed to answer the query is clearly absent from the observations.
-- FAIL if the observations show only errors or "(no tool assigned)" with no useful data.
+- PASS if the observations contain ANY relevant content about the query topic (web pages, formulas, facts, or descriptions related to the query).
+- FAIL only if the observations are completely empty, contain only errors, or are entirely off-topic.
+- Do not require a complete answer — just relevant content.
 
 Output one verdict per candidate, exactly in this format (no other text):
 VERDICT 0: PASS|FAIL
@@ -292,17 +290,18 @@ VERDICT {n - 1}: PASS|FAIL"""
 # Compiler: synthesizes N ensemble results into one compiled answer
 # ---------------------------------------------------------------------------
 def build_compiler_prompt(task: str, ensemble_answers: str) -> str:
-    return f"""You are a compiler. Multiple agents attempted the same task using different strategies. Each attempt has been evaluated as PASS or FAIL.
+    return f"""You are an expert synthesizer. Multiple agents gathered raw evidence (search results, calculations, tool observations) to answer a question. Your job is to read that raw evidence and write a clear, direct answer for the user.
 
-Task: {task}
+Question: {task}
 
-Here are all the attempts and their evaluations:
+Raw evidence from agents (search results, tool outputs, evaluations):
 {ensemble_answers}
 
-Your job:
-1. Weigh PASS results more heavily than FAIL results.
-2. Identify the most accurate and complete answer across all attempts.
-3. Compile a single, best answer that combines the strongest elements.
+Instructions:
+1. Read through all the raw evidence.
+2. Extract the key facts, numbers, and findings relevant to the question.
+3. Prefer evidence from PASS-evaluated agents, but use FAIL agents if they contain useful data.
+4. Write a single, well-structured answer addressed directly to the user.
 
-Output ONLY the compiled answer. Do not mention agents, attempts, or evaluations.
+Output ONLY the final answer. Do not mention agents, tools, evaluations, or internal processes.
 """

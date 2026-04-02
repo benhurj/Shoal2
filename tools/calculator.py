@@ -1,4 +1,5 @@
 import ast
+import math
 import operator
 from tools.base import BaseTool
 from models import ToolName
@@ -17,7 +18,16 @@ _SAFE_OPS = {
 }
 
 # Whitelisted callable names
-_SAFE_FUNCS = {"abs": abs, "round": round, "min": min, "max": max, "pow": pow}
+_SAFE_FUNCS = {
+    "abs": abs, "round": round, "min": min, "max": max, "pow": pow,
+    "sqrt": math.sqrt, "sin": math.sin, "cos": math.cos, "tan": math.tan,
+    "asin": math.asin, "acos": math.acos, "atan": math.atan, "atan2": math.atan2,
+    "log": math.log, "log2": math.log2, "log10": math.log10,
+    "exp": math.exp, "ceil": math.ceil, "floor": math.floor,
+}
+
+# Whitelisted named constants (e.g. pi, e)
+_SAFE_CONSTS = {"pi": math.pi, "e": math.e, "tau": math.tau, "inf": math.inf}
 
 
 def _safe_eval_node(node: ast.AST):
@@ -52,6 +62,8 @@ def _safe_eval_node(node: ast.AST):
         return _SAFE_FUNCS[func_name](*args)
 
     if isinstance(node, ast.Name):
+        if node.id in _SAFE_CONSTS:
+            return _SAFE_CONSTS[node.id]
         raise ValueError(f"Variable references not allowed: {node.id}")
 
     raise ValueError(f"Disallowed expression type: {type(node).__name__}")

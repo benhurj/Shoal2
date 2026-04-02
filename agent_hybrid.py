@@ -81,18 +81,35 @@ def _parse_plan_text(raw_output: str) -> list[dict]:
     # Parse "1. [tool] description" format (numbered)
     pattern = r'^\s*\d+[\.\)]\s*(?:\[(\w+)\]\s*)?(.+)'
     steps = []
+    _valid_tool_values = {t.name.value for t in TOOL_REGISTRY.values()}
+
+    def _resolve_hint(hint: str, description: str):
+        """Return (tool_hint, description) — recover real tool when model wrote a placeholder."""
+        h = hint.lower()
+        if h in _valid_tool_values:
+            return h, description
+        # Model wrote [TOOL] / [tool_name] / [none] literally → check description prefix
+        if h in ("tool", "tool_name", "toolname"):
+            first = description.split()[0].lower() if description else ""
+            if first in _valid_tool_values:
+                return first, description[len(first):].strip()
+            return "none", description
+        return h, description
+
     for match in re.finditer(pattern, raw_output, re.MULTILINE):
-        tool_hint = match.group(1) or "none"
+        raw_hint = match.group(1) or "none"
         description = match.group(2).strip()
-        steps.append({"task": description, "tool_hint": tool_hint.lower()})
+        tool_hint, description = _resolve_hint(raw_hint, description)
+        steps.append({"task": description, "tool_hint": tool_hint})
 
     # Fallback: parse "[tool] description" format (non-numbered)
     if not steps:
         unnumbered = r'^\s*\[(\w+)\]\s*(.+)'
         for match in re.finditer(unnumbered, raw_output, re.MULTILINE):
-            tool_hint = match.group(1) or "none"
+            raw_hint = match.group(1) or "none"
             description = match.group(2).strip()
-            steps.append({"task": description, "tool_hint": tool_hint.lower()})
+            tool_hint, description = _resolve_hint(raw_hint, description)
+            steps.append({"task": description, "tool_hint": tool_hint})
 
     # Last resort: treat each non-empty line as a task with no tool hint
     if not steps:
@@ -394,7 +411,8 @@ async def run_executor_direct(
             step = AgentStep(iteration=1, thought=task, is_final=False)
 
         all_steps.append(step)
-        lines.append(f"[{tool_hint}] {task}:\n{observation}")
+        if observation != "(no tool assigned)":
+            lines.append(f"[{tool_hint}] {task}:\n{observation}")
 
     return "\n\n".join(lines), all_steps, 0
 
@@ -581,7 +599,8 @@ async def run_executor_with_followup(
             ))
             observation = fu_observation  # pass latest result to next decision
 
-        lines.append(f"[{tool_hint}] {task}:\n{observation}")
+        if observation != "(no tool assigned)":
+            lines.append(f"[{tool_hint}] {task}:\n{observation}")
 
     return "\n\n".join(lines), all_steps, total_tokens
 
@@ -675,12 +694,23 @@ async def run_compiler(
     """Compile K agent results into one final answer."""
     logger.info("compiler_started", num_results=len(ensemble_results))
 
+    # Deduplicate: keep at most one candidate per unique role, prefer PASS over FAIL.
+    # Cap at 5 candidates to keep compiler context manageable.
+    seen_roles: set[str] = set()
+    deduped: list[EnsembleMemberResult] = []
+    for r in sorted(ensemble_results, key=lambda x: not (x.evaluation and x.evaluation.passed)):
+        if r.role not in seen_roles:
+            seen_roles.add(r.role)
+            deduped.append(r)
+        if len(deduped) >= 5:
+            break
+
     answers_text = "\n\n".join(
-        f"Agent '{r.config_label}' (role={r.role}, temp={r.llm_params.get('temperature', '?')}):\n"
-        f"  Answer: {r.final_answer}\n"
+        f"Agent '{r.config_label}' (role={r.role}):\n"
+        f"  Evidence: {(r.final_answer or '')[:1500]}\n"
         f"  Evaluation: {'PASS' if r.evaluation and r.evaluation.passed else 'FAIL'}"
         f"{' — ' + r.evaluation.feedback if r.evaluation and r.evaluation.feedback else ''}"
-        for r in ensemble_results
+        for r in deduped
     )
 
     messages = [
@@ -858,25 +888,53 @@ async def run_agent_many_samples(query: str) -> AgentResponse:
     ]
 
     t0 = time.monotonic()
-    all_sample_results = list(await asyncio.gather(*sample_tasks))
+    raw_results = await asyncio.gather(*sample_tasks, return_exceptions=True)
     elapsed = time.monotonic() - t0
     logger.info("many_samples_executor_done", elapsed_s=round(elapsed, 2),
                 k=ENSEMBLE_K, n=SAMPLES_PER_ROLE)
+
+    # Filter out failed samples so one bad executor call can't crash the whole pipeline
+    all_sample_results = []
+    _sample_roles = [(i, j) for i in range(ENSEMBLE_K) for j in range(SAMPLES_PER_ROLE)]
+    _valid_role_indices = []
+    for (i, j), result in zip(_sample_roles, raw_results):
+        if isinstance(result, Exception):
+            logger.warning("sample_failed", role_idx=i, sample_idx=j, error=repr(result))
+        else:
+            all_sample_results.append(result)
+            _valid_role_indices.append(i)
+
+    if not all_sample_results:
+        logger.error("all_samples_failed")
+        return AgentResponse(
+            query=query,
+            plan=["all executor samples failed"],
+            sub_task_results=[],
+            answer="(all executor samples failed — please retry)",
+            total_tokens=total_tokens,
+            iterations=0,
+            success=False,
+        )
+
     total_tokens += sum(r[2] for r in all_sample_results)
 
     # Stage 4: single unified evaluator — PASS/FAIL for every candidate
     flat_candidates = [
         {
-            "history":    all_sample_results[i * SAMPLES_PER_ROLE + j][0],
-            "steps":      all_sample_results[i * SAMPLES_PER_ROLE + j][1],
-            "role":       roles[i],
-            "role_label": roles[i]["label"],
+            "history":    r[0],
+            "steps":      r[1],
+            "role":       roles[role_idx],
+            "role_label": roles[role_idx]["label"],
         }
-        for i in range(ENSEMBLE_K)
-        for j in range(SAMPLES_PER_ROLE)
+        for r, role_idx in zip(all_sample_results, _valid_role_indices)
     ]
 
-    verdicts, tokens = await run_evaluator_unified(query, flat_candidates)
+    try:
+        verdicts, tokens = await run_evaluator_unified(query, flat_candidates)
+    except Exception as e:
+        logger.warning("evaluator_unified_failed_fallback", error=repr(e))
+        verdicts = [{"passed": True, "reason": "evaluator unavailable"} for _ in flat_candidates]
+        tokens = 0
     total_tokens += tokens
 
     # Keep only candidates the evaluator accepted

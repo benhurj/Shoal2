@@ -37,6 +37,46 @@ class SearchTool(BaseTool):
         with DDGS() as ddgs:
             return list(ddgs.text(query, max_results=n))
 
+    # Short all-caps or title-case navigation words (HOME, ARTICLES, About, etc.)
+    _NAV_WORDS = re.compile(
+        r'^(?:[A-Z]{2,}(?:\s+[A-Z]{2,})*|[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})$'
+    )
+
+    @staticmethod
+    def _clean_jina(text: str) -> str:
+        """Strip boilerplate navigation lines from Jina reader output.
+
+        Removes lines that are purely markdown list-links, standalone images,
+        checkbox lines, and short nav-word lines (HOME, ARTICLES, etc.).
+        Collapses consecutive blank lines.
+        """
+        nav_line = re.compile(
+            r'^\s*'
+            r'(?:'
+            r'\*\s+\[.*?\]\(.*?\)'       # * [text](url)
+            r'|[-•]\s+\[.*?\]\(.*?\)'    # - [text](url)  •  [text](url)
+            r'|\[x\]\s'                  # [x] checkbox lines
+            r'|\[\s*\]\s'               # [ ] empty checkbox
+            r'|!\[.*?\]\(.*?\)'          # ![img](url) standalone
+            r')\s*$'
+        )
+        lines = text.splitlines()
+        cleaned = []
+        prev_blank = False
+        for line in lines:
+            stripped = line.strip()
+            if nav_line.match(line):
+                continue
+            # Drop short all-caps or title-case nav words (HOME, ARTICLES, About Us)
+            if stripped and len(stripped) <= 30 and SearchTool._NAV_WORDS.match(stripped):
+                continue
+            is_blank = not stripped
+            if is_blank and prev_blank:
+                continue  # collapse multiple blanks
+            cleaned.append(line)
+            prev_blank = is_blank
+        return "\n".join(cleaned).strip()
+
     async def _fetch_page(self, url: str, snippet: str, client: httpx.AsyncClient) -> str:
         """Fetch page content via Jina Reader, fall back to DDGS snippet."""
         try:
@@ -48,7 +88,7 @@ class SearchTool(BaseTool):
             )
             text = resp.text.strip()
             if text and not any(text.startswith(m) for m in _JINA_ERROR_MARKERS):
-                return text[:SEARCH_MAX_CHARS]
+                return self._clean_jina(text)[:SEARCH_MAX_CHARS]
         except Exception:
             pass
         return snippet  # fallback

@@ -28,7 +28,7 @@ LOGPROBS_TOP_K = 5  # Number of top tokens to return logprobs for (0-20)
 if DEPLOYMENT_MODE == "hybrid":
     WORKER_MODEL = os.getenv("LOCAL_WORKER_MODEL", "smollm2:135m-instruct")
 else:
-    WORKER_MODEL = "HuggingFaceTB/SmolLM2-135M-Instruct"
+    WORKER_MODEL = "HuggingFaceTB/SmolLM2-360M-Instruct"
 
 if DEPLOYMENT_MODE == "ollama_cloud":
     WORKER_PORTS = ["cloud-worker"]
@@ -85,11 +85,11 @@ MAX_FOLLOW_UPS = 2     # Max 135M follow-up decisions per plan step
 FOLLOW_UP_MAX_TOKENS = 64  # Token budget for 135M decision output
 
 # ── Per-stage token limits ──
-PLANNER_MAX_TOKENS = 512
+PLANNER_MAX_TOKENS = 768
 EXECUTOR_MAX_TOKENS = 512
 SELF_CHECK_MAX_TOKENS = 16  # legacy: self-check (/agent endpoint only)
-EVALUATOR_MAX_TOKENS = 512
-COMPILER_MAX_TOKENS = 512
+EVALUATOR_MAX_TOKENS = 512  # 15 VERDICT lines needs ~300 tokens + reasoning
+COMPILER_MAX_TOKENS = 2048
 
 # ── Agent loop limits ──
 REACT_MAX_ITERATIONS = 4       # Max tool loops per executor run
