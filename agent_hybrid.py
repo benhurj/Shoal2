@@ -670,6 +670,7 @@ async def run_evaluator_unified(
         max_tokens=EVALUATOR_MAX_TOKENS,
     )
 
+    logger.info("evaluator_unified_raw", output=raw_output[:500])
     verdicts: list[dict] = [{"passed": False, "reason": ""} for _ in candidates]
     for m in re.finditer(r"VERDICT\s+(\d+):\s*(PASS|FAIL)(?:\s*[-:]\s*(.+))?", raw_output, re.IGNORECASE):
         idx = int(m.group(1))

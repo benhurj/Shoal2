@@ -280,7 +280,7 @@ class LLMClient:
                 raise RuntimeError(f"Modal call timed out after {attempt + 1} attempts")
             except httpx.HTTPStatusError as e:
                 last_err = e
-                if e.response.status_code in (303, 429, 502, 503):
+                if e.response.status_code in (303, 429, 500, 502, 503):
                     logger.warning("modal_retry", status=e.response.status_code,
                                  attempt=attempt + 1, url=url)
                     continue
