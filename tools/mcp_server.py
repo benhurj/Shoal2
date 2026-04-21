@@ -39,26 +39,13 @@ async def search(input: str) -> str:
 
 @mcp.tool()
 async def calculator(input: str) -> str:
-    """Evaluate a Python arithmetic expression and return the numeric result.
+    """Evaluate a Python math expression (digits and operators only, e.g. '17 * 23'). Input must be a valid Python expression — NOT natural language.
 
-    Input MUST be a valid Python arithmetic expression using numbers and operators.
     Allowed operators: + - * / // % **
     Allowed functions: abs(), round(), min(), max(), pow()
 
-    Examples of VALID inputs:
-      - "2 + 3"
-      - "1024 * 0.9"
-      - "round(3.14159, 2)"
-      - "(100 - 15) / 4"
-      - "abs(-42) + pow(2, 10)"
-
-    Examples of INVALID inputs — DO NOT use these:
-      - "aggregate data into a table"    ← text descriptions are INVALID
-      - "calculate the average score"    ← natural language is INVALID
-      - "compare range and cargo volume" ← comparisons in words are INVALID
-      - "x + y"                          ← variable names are INVALID
-
-    Only call this tool when you have actual numeric values to compute.
+    VALID: "17 * 23", "1024 * 0.9", "(100 - 15) / 4", "abs(-42) + pow(2, 10)"
+    INVALID: "calculate the total", "x + y", "aggregate data"
     """
     return await _calc.execute(input)
 

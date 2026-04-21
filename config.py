@@ -28,7 +28,7 @@ LOGPROBS_TOP_K = 5  # Number of top tokens to return logprobs for (0-20)
 if DEPLOYMENT_MODE == "hybrid":
     WORKER_MODEL = os.getenv("LOCAL_WORKER_MODEL", "smollm2:135m-instruct")
 else:
-    WORKER_MODEL = "HuggingFaceTB/SmolLM2-135M-Instruct"
+    WORKER_MODEL = "HuggingFaceTB/SmolLM2-360M-Instruct"
 
 if DEPLOYMENT_MODE == "ollama_cloud":
     WORKER_PORTS = ["cloud-worker"]
@@ -85,11 +85,11 @@ MAX_FOLLOW_UPS = 2     # Max 135M follow-up decisions per plan step
 FOLLOW_UP_MAX_TOKENS = 64  # Token budget for 135M decision output
 
 # ── Per-stage token limits ──
-PLANNER_MAX_TOKENS = 512
+PLANNER_MAX_TOKENS = 768
 EXECUTOR_MAX_TOKENS = 512
 SELF_CHECK_MAX_TOKENS = 16  # legacy: self-check (/agent endpoint only)
-EVALUATOR_MAX_TOKENS = 512
-COMPILER_MAX_TOKENS = 512
+EVALUATOR_MAX_TOKENS = 512  # 15 VERDICT lines needs ~300 tokens + reasoning
+COMPILER_MAX_TOKENS = 2500
 
 # ── Agent loop limits ──
 REACT_MAX_ITERATIONS = 4       # Max tool loops per executor run
@@ -99,4 +99,4 @@ MAX_CONCURRENT_LLM_CALLS = 15  # Semaphore limit; raised for K×N parallel calls
 
 # ── Search tool ──
 SEARCH_TOP_N = 3          # Default number of pages to fetch per search
-SEARCH_MAX_CHARS = 2000   # Max characters per page (truncation guard)
+SEARCH_MAX_CHARS = 4000   # Max characters per page (truncation guard)

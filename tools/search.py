@@ -13,6 +13,23 @@ _JINA_ERROR_MARKERS = (
     "Warning: Target URL returned error",
 )
 
+# Short all-caps or title-case navigation words (HOME, ARTICLES, About, etc.)
+_NAV_WORDS_RE = re.compile(
+    r'^(?:[A-Z]{2,}(?:\s+[A-Z]{2,})*|[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})$'
+)
+
+# Markdown nav-line patterns (list-links, image-only lines, checkboxes)
+_NAV_LINE_RE = re.compile(
+    r'^\s*'
+    r'(?:'
+    r'\*\s+\[.*?\]\(.*?\)'       # * [text](url)
+    r'|[-•]\s+\[.*?\]\(.*?\)'    # - [text](url)  •  [text](url)
+    r'|\[x\]\s'                  # [x] checkbox lines
+    r'|\[\s*\]\s'                # [ ] empty checkbox
+    r'|!\[.*?\]\(.*?\)'          # ![img](url) standalone
+    r')\s*$'
+)
+
 
 class SearchTool(BaseTool):
     name = ToolName.SEARCH
@@ -37,18 +54,43 @@ class SearchTool(BaseTool):
         with DDGS() as ddgs:
             return list(ddgs.text(query, max_results=n))
 
+    @staticmethod
+    def _clean_jina(text: str) -> str:
+        """Strip boilerplate navigation lines from Jina reader output.
+
+        Removes lines that are purely markdown list-links, standalone images,
+        checkbox lines, and short nav-word lines (HOME, ARTICLES, etc.).
+        Collapses consecutive blank lines.
+        """
+        lines = text.splitlines()
+        cleaned = []
+        prev_blank = False
+        for line in lines:
+            stripped = line.strip()
+            if _NAV_LINE_RE.match(line):
+                continue
+            # Drop short all-caps or title-case nav words (HOME, ARTICLES, About Us)
+            if stripped and len(stripped) <= 30 and _NAV_WORDS_RE.match(stripped):
+                continue
+            is_blank = not stripped
+            if is_blank and prev_blank:
+                continue  # collapse multiple blanks
+            cleaned.append(line)
+            prev_blank = is_blank
+        return "\n".join(cleaned).strip()
+
     async def _fetch_page(self, url: str, snippet: str, client: httpx.AsyncClient) -> str:
         """Fetch page content via Jina Reader, fall back to DDGS snippet."""
         try:
             resp = await client.get(
                 f"https://r.jina.ai/{url}",
-                timeout=10,
+                timeout=20,
                 headers={"Accept": "text/plain"},
                 follow_redirects=True,
             )
             text = resp.text.strip()
             if text and not any(text.startswith(m) for m in _JINA_ERROR_MARKERS):
-                return text[:SEARCH_MAX_CHARS]
+                return self._clean_jina(text)[:SEARCH_MAX_CHARS]
         except Exception:
             pass
         return snippet  # fallback

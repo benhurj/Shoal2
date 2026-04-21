@@ -84,9 +84,9 @@ class MCPClient:
         tools = await self.list_tools()
         parts = []
         for t in tools:
-            # First paragraph only (up to first blank line)
-            first_para = t["description"].strip().split("\n\n")[0]
-            short = " ".join(first_para.splitlines()).strip()
+            # First two paragraphs so constraints (e.g. "input must be a Python expression") are visible
+            paras = t["description"].strip().split("\n\n")[:2]
+            short = " | ".join(" ".join(p.splitlines()).strip() for p in paras if p.strip())
             parts.append(f"  - {t['name']}: {short}")
         return "\n".join(parts)
 
