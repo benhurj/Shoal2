@@ -27,7 +27,7 @@ _SAFE_FUNCS = {
 }
 
 # Whitelisted named constants (e.g. pi, e)
-_SAFE_CONSTS = {"pi": math.pi, "e": math.e, "tau": math.tau, "inf": math.inf}
+_SAFE_CONSTS = {"pi": math.pi, "e": math.e, "tau": math.tau}
 
 
 def _safe_eval_node(node: ast.AST):

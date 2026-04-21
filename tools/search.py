@@ -13,6 +13,23 @@ _JINA_ERROR_MARKERS = (
     "Warning: Target URL returned error",
 )
 
+# Short all-caps or title-case navigation words (HOME, ARTICLES, About, etc.)
+_NAV_WORDS_RE = re.compile(
+    r'^(?:[A-Z]{2,}(?:\s+[A-Z]{2,})*|[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})$'
+)
+
+# Markdown nav-line patterns (list-links, image-only lines, checkboxes)
+_NAV_LINE_RE = re.compile(
+    r'^\s*'
+    r'(?:'
+    r'\*\s+\[.*?\]\(.*?\)'       # * [text](url)
+    r'|[-•]\s+\[.*?\]\(.*?\)'    # - [text](url)  •  [text](url)
+    r'|\[x\]\s'                  # [x] checkbox lines
+    r'|\[\s*\]\s'                # [ ] empty checkbox
+    r'|!\[.*?\]\(.*?\)'          # ![img](url) standalone
+    r')\s*$'
+)
+
 
 class SearchTool(BaseTool):
     name = ToolName.SEARCH
@@ -37,11 +54,6 @@ class SearchTool(BaseTool):
         with DDGS() as ddgs:
             return list(ddgs.text(query, max_results=n))
 
-    # Short all-caps or title-case navigation words (HOME, ARTICLES, About, etc.)
-    _NAV_WORDS = re.compile(
-        r'^(?:[A-Z]{2,}(?:\s+[A-Z]{2,})*|[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})$'
-    )
-
     @staticmethod
     def _clean_jina(text: str) -> str:
         """Strip boilerplate navigation lines from Jina reader output.
@@ -50,25 +62,15 @@ class SearchTool(BaseTool):
         checkbox lines, and short nav-word lines (HOME, ARTICLES, etc.).
         Collapses consecutive blank lines.
         """
-        nav_line = re.compile(
-            r'^\s*'
-            r'(?:'
-            r'\*\s+\[.*?\]\(.*?\)'       # * [text](url)
-            r'|[-•]\s+\[.*?\]\(.*?\)'    # - [text](url)  •  [text](url)
-            r'|\[x\]\s'                  # [x] checkbox lines
-            r'|\[\s*\]\s'               # [ ] empty checkbox
-            r'|!\[.*?\]\(.*?\)'          # ![img](url) standalone
-            r')\s*$'
-        )
         lines = text.splitlines()
         cleaned = []
         prev_blank = False
         for line in lines:
             stripped = line.strip()
-            if nav_line.match(line):
+            if _NAV_LINE_RE.match(line):
                 continue
             # Drop short all-caps or title-case nav words (HOME, ARTICLES, About Us)
-            if stripped and len(stripped) <= 30 and SearchTool._NAV_WORDS.match(stripped):
+            if stripped and len(stripped) <= 30 and _NAV_WORDS_RE.match(stripped):
                 continue
             is_blank = not stripped
             if is_blank and prev_blank:

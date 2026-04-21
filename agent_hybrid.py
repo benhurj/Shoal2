@@ -1,9 +1,15 @@
 # agent_hybrid.py
+import ast
 import asyncio
 import random
 import re
 import time
 import structlog
+
+_CALC_PREFIX_RE = re.compile(
+    r'^(?:calculate|compute|evaluate|what\s+is|what\'s|find|determine)\s*:?\s*',
+    re.IGNORECASE,
+)
 from config import (
     WORKER_MODEL, WORKER_PORTS, COMPILER_MODEL, COMPILER_PORTS,
     REACT_MAX_ITERATIONS, MAX_PLAN_STEPS,
@@ -510,18 +516,14 @@ async def run_executor_with_followup(
             # Try the task directly, then strip common natural-language prefixes
             # (e.g. "Calculate 17 * 23" → "17 * 23") before giving up.
             if tool_name == ToolName.CALCULATOR:
-                import ast as _ast, re as _re
                 _calc_input = task.strip()
                 _skip_calculator = True
                 for _candidate in [
                     _calc_input,
-                    _re.sub(
-                        r'^(?:calculate|compute|evaluate|what\s+is|what\'s|find|determine)\s*:?\s*',
-                        '', _calc_input, flags=_re.IGNORECASE,
-                    ).rstrip('?. '),
+                    _CALC_PREFIX_RE.sub('', _calc_input).rstrip('?. '),
                 ]:
                     try:
-                        _ast.parse(_candidate.strip(), mode='eval')
+                        ast.parse(_candidate.strip(), mode='eval')
                         _calc_input = _candidate.strip()
                         _skip_calculator = False
                         break
