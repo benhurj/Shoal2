@@ -35,11 +35,41 @@ class AgentStep(BaseModel):
     final_answer: Optional[str] = None
 
 
+class EvaluationResult(BaseModel):
+    """Evaluator's judgement of an Executor's sub-task output."""
+    passed: bool
+    feedback: str = ""
+
+
+class EnsembleMemberResult(BaseModel):
+    """Result from one member of the ensemble (one role-based config)."""
+    config_label: str                        # e.g. "methodical"
+    role: str = ""                           # role name for compiler context
+    llm_params: dict                         # the actual overrides used
+    executor_steps: list[AgentStep] = []
+    final_answer: str = ""
+    evaluation: Optional[EvaluationResult] = None
+    tokens_used: int = 0
+
+
+class SubTaskResult(BaseModel):
+    """Result of one Planner sub-task through the Executor/Evaluator cycle."""
+    sub_task: str
+    executor_steps: list[AgentStep] = []     # Used in non-ensemble (fast path)
+    evaluator_result: Optional[EvaluationResult] = None
+    ensemble_results: list[EnsembleMemberResult] = []   # Ensemble members
+    compiled_answer: str = ""                # Compiler output
+    attempts: int = 1
+    passed: bool = False
+
+
 class AgentResponse(BaseModel):
     """Full agent response returned to the user."""
     query: str
+    plan: Optional[list[str]] = None         # None if fast-path was used
+    sub_task_results: list[SubTaskResult] = []
     answer: str
-    steps: list[AgentStep]
+    steps: list[AgentStep] = []              # Kept for fast-path compatibility
     total_tokens: int = 0
     iterations: int = 0
     success: bool = True

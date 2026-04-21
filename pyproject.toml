@@ -1,13 +1,21 @@
 [project]
 name = "shoal"
-version = "0.1.0"
-description = "Add your description here"
+version = "0.2.0"
+description = "Multi-agent ensemble ReAct system with role-based differentiation"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "ddgs>=9.11.1",
     "fastapi>=0.133.1",
     "httpx>=0.28.1",
     "pydantic>=2.12.5",
+    "python-dotenv>=1.2.2",
     "structlog>=25.5.0",
     "uvicorn>=0.41.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=9.0",
+    "pytest-asyncio>=1.0",
 ]
