@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ── Deployment Mode ──
-DEPLOYMENT_MODE = "ollama_cloud"  # Options: "local", "ollama_cloud", "openai"
+DEPLOYMENT_MODE = os.getenv("DEPLOYMENT_MODE", "ollama_cloud")  # Options: "local", "ollama_cloud", "openai"
 
 # Cloud API configuration (loaded from .env)
 OLLAMA_CLOUD_API_KEY = os.getenv("OLLAMA_CLOUD_API_KEY")

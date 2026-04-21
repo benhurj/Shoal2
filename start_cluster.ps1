@@ -12,8 +12,8 @@ param(
 )
 
 # ── Configuration ──
-$WorkerModel   = "smollm2:135m"
-$CompilerModel = "qwen3.5:0.8b"
+$WorkerModel   = "gemma3:4b"
+$CompilerModel = "gemma3:12b"
 $WorkerPorts   = @(11434, 11435, 11436, 11437, 11438)  # K=5
 $CompilerPorts = @(11440)                                # L=1
 $AllPorts      = $WorkerPorts + $CompilerPorts

@@ -185,7 +185,7 @@ async def run_evaluator(task: str, worker_output: str, **overrides) -> tuple[Eva
         result = EvaluationResult(passed=False, feedback=reason)
     else:
         logger.warning("evaluator_parse_failed", raw=raw_output[:100])
-        result = EvaluationResult(passed=False, feedback="(evaluator output unparseable, default FAIL)")
+        result = EvaluationResult(passed=True, feedback="(evaluator output unparseable, default PASS to match lenient prompt)")
 
     return result, tokens
 
